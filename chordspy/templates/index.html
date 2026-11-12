@@ -76,8 +76,9 @@
     </style>
 </head>
 
-<!-- Main body with flex layout and dark mode background classes -->
-<body class="bg-gray-100 dark:bg-gray-900 flex flex-col min-h-screen">
+<!-- Main body with flex layout and dark mode background classes. The text colours are the fallback for any text
+     without its own colour, which would otherwise be the browser's black, invisible in dark mode -->
+<body class="bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-gray-200 flex flex-col min-h-screen">
     <!-- 
       Header Section - Contains app title, theme toggle, and action buttons
     -->

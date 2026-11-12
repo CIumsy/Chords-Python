@@ -37,6 +37,7 @@ log.setLevel(logging.ERROR)              # Only show errors from Werkzeug (Flask
 # Global variables
 connection_manager = None  # Manages the device connection
 connection_thread = None   # Thread for connection management
+connection_protocol = None # Protocol of the latest connection ('usb', 'wifi' or 'ble'), so a reloaded page can highlight it
 ble_devices = []           # List of discovered BLE devices
 stream_active = False      # Flag indicating if data stream is active
 running_apps = {}          # Dictionary to track running applications
@@ -192,10 +193,10 @@ def check_stream():
     """
     Check if data stream is currently active.
     Returns:
-        JSON response with connection status.
+        JSON response with connection status, and the protocol while connected.
     """
     is_connected = connection_manager.stream_active if hasattr(connection_manager, 'stream_active') else False
-    return jsonify({'connected': is_connected})
+    return jsonify({'connected': is_connected, 'protocol': connection_protocol if is_connected else None})
 
 # Route to check the current connection status with the device. It returns 'connected' if the stream is active, otherwise 'connecting'.
 @app.route('/check_connection')
@@ -299,11 +300,12 @@ def connect_device():
     Returns:
         JSON response indicating connection status.
     """
-    global connection_manager, connection_thread, stream_active
-    
+    global connection_manager, connection_thread, stream_active, connection_protocol
+
     data = request.get_json()
     protocol = data.get('protocol')
     device_address = data.get('device_address')
+    connection_protocol = protocol
     
     # Reset stream status
     stream_active = False

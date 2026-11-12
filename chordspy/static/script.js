@@ -413,28 +413,27 @@ function getTimestamp() {
     return `${year}${month}${day}_${hours}${minutes}${seconds}`;
 }
 
-function setProtocolButtonsDisabled(disabled) {
+// Protocol buttons (WiFi, Bluetooth, Serial). Each look sets the button's whole class list, so no colour from an earlier
+// state is left behind: with two text colours on one button (e.g. text-white and text-gray-700) the order of Tailwind's
+// generated CSS decides which one shows, which made the text white on a light background after a Bluetooth stream drop.
+const PROTOCOL_BTN_BASE = 'connection-btn h-10 px-4 border-2 border-cyan-500 rounded-lg flex items-center gap-2 transition-colors';
+const PROTOCOL_BTN_LOOKS = {
+    idle:      'text-gray-700 dark:text-gray-200 hover:bg-cyan-600 dark:hover:bg-cyan-700 hover:text-white cursor-pointer',
+    selected:  'bg-cyan-600 dark:bg-cyan-700 text-white cursor-pointer',
+    connected: 'bg-cyan-700 dark:bg-cyan-800 text-white cursor-default',
+    locked:    'text-gray-400 dark:text-gray-500 cursor-not-allowed',    // Another protocol is connecting or connected
+};
+
+// phase: 'idle' (a protocol can be picked) | 'connecting' | 'connected'. The selected protocol is highlighted.
+function renderProtocolButtons(phase) {
     connectionBtns.forEach(btn => {
-        btn.disabled = disabled;
-        // Add/remove cursor-not-allowed class based on disabled state
-        if (disabled) {
-            btn.classList.add('cursor-not-allowed');
-            // Only keep the connected protocol button highlighted
-            if (btn.dataset.protocol !== selectedProtocol) {
-                btn.classList.remove('bg-cyan-600', 'dark:bg-cyan-700', 'text-white');
-                // Set to original colors (dark mode aware)
-                btn.classList.add('text-gray-700', 'dark:text-gray-200');
-                btn.classList.remove('hover:bg-cyan-600', 'dark:hover:bg-cyan-700', 'hover:text-white');
-            } else {
-                // Make connected protocol button darker
-                btn.classList.remove('bg-cyan-600', 'dark:bg-cyan-700');
-                btn.classList.add('bg-cyan-700', 'dark:bg-cyan-800');
-            }
-        } else {
-            btn.classList.remove('cursor-not-allowed');
-            btn.classList.add('hover:bg-cyan-600', 'dark:hover:bg-cyan-700', 'hover:text-white');
-            btn.classList.remove('bg-cyan-700', 'dark:bg-cyan-800');
-        }
+        const chosen = btn.dataset.protocol === selectedProtocol;
+        let look;
+        if (phase === 'idle') look = chosen ? 'selected' : 'idle';
+        else if (chosen) look = phase === 'connected' ? 'connected' : 'selected';
+        else look = 'locked';
+        btn.className = `${PROTOCOL_BTN_BASE} ${PROTOCOL_BTN_LOOKS[look]}`;
+        btn.disabled = phase !== 'idle';
     });
 }
 
@@ -471,10 +470,9 @@ filenameInput.addEventListener('input', function() {
 // Handle protocol selection
 connectionBtns.forEach(btn => {
     btn.addEventListener('click', () => {
-        connectionBtns.forEach(b => b.classList.remove('bg-cyan-600', 'dark:bg-cyan-700', 'text-white'));
-        btn.classList.add('bg-cyan-600', 'dark:bg-cyan-700', 'text-white');
         selectedProtocol = btn.dataset.protocol;
-        
+        renderProtocolButtons('idle');
+
         // For BLE, show device selection modal
         if (selectedProtocol === 'ble') {
             showBleDeviceModal();
@@ -571,9 +569,9 @@ function renderBleDevices(devices) {
 // Close BLE modal
 closeBleModal.addEventListener('click', () => {
     bleModal.classList.add('hidden');
-    connectionBtns.forEach(b => b.classList.remove('bg-cyan-600', 'dark:bg-cyan-700', 'text-white'));
     selectedProtocol = null;
     selectedBleDevice = null;
+    renderProtocolButtons('idle');
     connectBtn.disabled = true;
 });
 
@@ -596,7 +594,7 @@ connectBtn.addEventListener('click', async () => {
     // Transition to connecting state
     connectBtn.classList.add('hidden');
     connectingBtn.classList.remove('hidden');
-    connectionBtns.forEach(btn => btn.disabled = true);
+    renderProtocolButtons('connecting');
 
     try {
         let postData = { protocol: selectedProtocol };
@@ -629,7 +627,7 @@ connectBtn.addEventListener('click', async () => {
         connectingBtn.classList.add('hidden');
         connectBtn.classList.remove('hidden');
         connectBtn.disabled = false;
-        connectionBtns.forEach(btn => btn.disabled = false);
+        renderProtocolButtons('idle');
     }
 });
 
@@ -670,7 +668,7 @@ async function pollConnectionStatus() {
             connectingBtn.classList.add('hidden');
             connectBtn.classList.remove('hidden');
             connectBtn.disabled = false;
-            connectionBtns.forEach(btn => btn.disabled = false);
+            renderProtocolButtons('idle');
             return false;
         }
     };
@@ -681,28 +679,15 @@ async function pollConnectionStatus() {
 function handleConnectionSuccess() {
     isConnected = true;
     // Transition to disconnect state
+    connectBtn.classList.add('hidden');
     connectingBtn.classList.add('hidden');
     disconnectBtn.classList.remove('hidden');
-    
-    // Highlight the connected protocol and disable others
-    connectionBtns.forEach(btn => {
-        if (btn.dataset.protocol === selectedProtocol) {
-            // Connected protocol - make it darker
-            btn.classList.remove('bg-cyan-600', 'dark:bg-cyan-700', 'hover:bg-cyan-600', 'dark:hover:bg-cyan-700');
-            btn.classList.add('bg-cyan-700', 'dark:bg-cyan-800', 'cursor-default');
-            btn.classList.add('text-white');
-        } else {
-            // Other protocols - disable and make less prominent
-            btn.classList.remove('bg-cyan-600', 'dark:bg-cyan-700', 'text-white', 'hover:bg-cyan-600', 'dark:hover:bg-cyan-700', 'hover:text-white');
-            btn.classList.add('cursor-not-allowed', 'text-gray-400', 'dark:text-gray-500');
-        }
-        btn.disabled = true;
-    });
-    
+    renderProtocolButtons('connected');    // Highlight the connected protocol and lock the others
+
     // Connected again: close error toasts that are no longer true (they stay until closed otherwise)
     toasts.filter(t => t.id === 'error:Stream disconnected!' || t.id.startsWith('error:Connection failed'))
           .forEach(removeToast);
-    showToast('success', `Connected via ${selectedProtocol.toUpperCase()}`);
+    showToast('success', selectedProtocol ? `Connected via ${selectedProtocol.toUpperCase()}` : 'Connected');
 
     // Start console updates
     startConsoleUpdates();
@@ -744,33 +729,13 @@ disconnectBtn.addEventListener('click', async () => {
             disconnectingBtn.classList.add('hidden');
             connectBtn.classList.remove('hidden');
             showToast('message', 'Disconnected!');
-            
-            // Reset all protocol buttons
-            connectionBtns.forEach(btn => {
-                btn.disabled = false;
-                btn.classList.remove(
-                    'bg-cyan-600', 'dark:bg-cyan-700', 'bg-cyan-700', 'dark:bg-cyan-800', 
-                    'text-white', 'cursor-not-allowed', 'cursor-default',
-                    'text-gray-400', 'dark:text-gray-500'
-                );
-                btn.classList.add(
-                    'hover:bg-cyan-600', 'dark:hover:bg-cyan-700', 'hover:text-white',
-                    'text-gray-700', 'dark:text-gray-200',
-                    'cursor-pointer'
-                );
-            });
 
+            // Reset all protocol buttons
             selectedProtocol = null;
             selectedBleDevice = null;
-            
-            // Stop recording if active
-            if (isRecording) {
-                isRecording = false; // Force set to false since we're disconnecting
-                recordBtn.innerHTML = 'Start Recording';
-                recordBtn.classList.remove('bg-gray-500');
-                recordBtn.classList.add('bg-red-500', 'hover:bg-red-600');
-                recordingStatus.classList.add('hidden');
-            }
+            renderProtocolButtons('idle');
+
+            if (isRecording) showRecordingStopped();
             
             // Stop console updates
             if (eventSource) {
@@ -811,6 +776,18 @@ function startConsoleUpdates() {
 // Handle record button
 recordBtn.addEventListener('click', toggleRecording);
 
+// Back to the not-recording look: Start Recording button, and the filename can be edited again
+function showRecordingStopped() {
+    isRecording = false;
+    recordBtn.innerHTML = 'Start Recording';
+    recordBtn.classList.remove('bg-gray-500');
+    recordBtn.classList.add('bg-red-500', 'hover:bg-red-600');
+    recordingStatus.classList.add('hidden');
+    filenameInput.disabled = false;
+    filenameInput.classList.remove('bg-gray-100', 'dark:bg-gray-700', 'cursor-not-allowed');
+    filenameInput.classList.add('dark:bg-gray-800');
+}
+
 // In the toggleRecording function
 function toggleRecording() {
     if (!isConnected) {
@@ -832,17 +809,8 @@ function toggleRecording() {
             .then(response => response.json())
             .then(data => {
                 if (data.status === 'recording_stopped') {
-                    isRecording = false;
-                    recordBtn.innerHTML = 'Start Recording';
-                    recordBtn.classList.remove('bg-gray-500');
-                    recordBtn.classList.add('bg-red-500', 'hover:bg-red-600');
-                    recordingStatus.classList.add('hidden');
-                    
-                    // Enable filename input
-                    filenameInput.disabled = false;
-                    filenameInput.classList.remove('bg-gray-100', 'dark:bg-gray-700', 'cursor-not-allowed');
-                    filenameInput.classList.add('dark:bg-gray-800');
-                    updateFilenameTimestamp()
+                    showRecordingStopped();
+                    updateFilenameTimestamp();
                     showToast('message', 'Recording stopped');
                 }
             })
@@ -1093,52 +1061,12 @@ function checkStreamStatus() {
     fetch('/check_stream')
         .then(response => response.json())
         .then(data => {
-            if (data.connected) {
-                // If connected, update the frontend
-                if (!isConnected) {
-                    handleConnectionSuccess();
-                    isConnected = true;
-                    connectBtn.classList.add('hidden');
-                    connectingBtn.classList.add('hidden');
-                    disconnectBtn.classList.remove('hidden');
-                    // Disable all protocol buttons
-                    setProtocolButtonsDisabled(true);
-                    startConsoleUpdates();
-                }
-            } else {
-                // If not connected, update the frontend
-                if (isConnected) {
-                    handleDisconnection();
-                    isConnected = false;
-                    disconnectBtn.classList.add('hidden');
-                    disconnectingBtn.classList.add('hidden');
-                    connectingBtn.classList.add('hidden');
-                    connectBtn.classList.remove('hidden');
-                    
-                    // Re-enable protocol buttons
-                    setProtocolButtonsDisabled(false);
-                    
-                    // Stop recording if active and update button
-                    if (isRecording) {
-                        isRecording = false;
-                        recordBtn.innerHTML = 'Start Recording';
-                        recordBtn.classList.remove('bg-gray-500');
-                        recordBtn.classList.add('bg-red-500', 'hover:bg-red-600');
-                        recordingStatus.classList.add('hidden');
-                        
-                        // Enable filename input if recording was stopped due to disconnection
-                        filenameInput.disabled = false;
-                        filenameInput.classList.remove('bg-gray-100', 'dark:bg-gray-700', 'cursor-not-allowed');
-                        filenameInput.classList.add('dark:bg-gray-800');
-                        showToast('warning', 'Recording stopped (connection lost)');
-                    }
-                    
-                    // Stop console updates
-                    if (eventSource) {
-                        eventSource.close();
-                        eventSource = null;
-                    }
-                }
+            if (data.connected && !isConnected) {
+                // The server knows the protocol, e.g. when this page was reloaded while connected
+                if (data.protocol) selectedProtocol = data.protocol;
+                handleConnectionSuccess();
+            } else if (!data.connected && isConnected) {
+                handleDisconnection();
             }
         })
         .catch(error => {
@@ -1153,22 +1081,16 @@ function handleDisconnection() {
     connectingBtn.classList.add('hidden');
     connectBtn.classList.remove('hidden');
     showToast('error', 'Stream disconnected!');
-    
-    // Reset protocol buttons
-    connectionBtns.forEach(btn => {
-        btn.disabled = false;
-        btn.classList.remove('bg-cyan-700', 'dark:bg-cyan-800', 'cursor-default');
-        btn.classList.add('hover:bg-cyan-600', 'dark:hover:bg-cyan-700', 'hover:text-white');
-    });
-    
-    // Handle recording state
+
+    // Unlock the protocol buttons. The lost protocol stays selected so Connect reconnects to it, unless it is
+    // Bluetooth and the device is unknown (the page was reloaded while connected): then a protocol is picked again.
+    const canReconnect = selectedProtocol && (selectedProtocol !== 'ble' || selectedBleDevice);
+    if (!canReconnect) selectedProtocol = null;
+    connectBtn.disabled = !canReconnect;
+    renderProtocolButtons('idle');
+
     if (isRecording) {
-        isRecording = false;
-        recordBtn.innerHTML = 'Start Recording';
-        recordBtn.classList.remove('bg-gray-500');
-        recordBtn.classList.add('bg-red-500', 'hover:bg-red-600');
-        recordingStatus.classList.add('hidden');
-        filenameInput.disabled = false;
+        showRecordingStopped();
         showToast('warning', 'Recording stopped (stream lost)');
     }
     
