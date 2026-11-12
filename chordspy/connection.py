@@ -30,7 +30,7 @@ from datetime import datetime                    # For timestamp generation
 import threading                                 # For multi-threaded operations
 from collections import deque                    # For efficient rate calculation
 from pylsl import StreamInfo, StreamOutlet       # LSL streaming components
-from pylsl import StreamInlet, resolve_stream    # LSL stream resolution
+from pylsl import StreamInlet, resolve_byprop    # LSL stream resolution
 from pylsl import local_clock                    # For precise timing
 import numpy as np                               # For numerical operations
 
@@ -252,7 +252,7 @@ class Connection:
             duration: Measurement duration in seconds
         """
         try:
-            streams = resolve_stream('type', self.stream_type)
+            streams = resolve_byprop('type', self.stream_type)
             if not streams:
                 print("No LSL stream found to verify.")
                 return
