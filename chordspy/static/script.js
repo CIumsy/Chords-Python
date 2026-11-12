@@ -377,6 +377,7 @@ const rescanBle = document.getElementById('rescan-ble');
 let selectedProtocol = null;
 let selectedBleDevice = null;
 let isConnected = false;
+let isDisconnecting = false;    // True while a Disconnect the user pressed is in progress, so it is not reported as stream loss
 let isRecording = false;
 let eventSource = null;
 let isScanning = false;
@@ -715,6 +716,8 @@ function launchApplication(appName) {
 
 // Handle disconnect button
 disconnectBtn.addEventListener('click', async () => {
+    // The server marks the stream inactive before its reply arrives; until then the status check must not see that as a loss
+    isDisconnecting = true;
     try {
         // Show connecting state during disconnection
         disconnectBtn.classList.add('hidden');
@@ -749,6 +752,8 @@ disconnectBtn.addEventListener('click', async () => {
         disconnectingBtn.classList.add('hidden');
         disconnectBtn.classList.remove('hidden');
         showToast('error', `Disconnection failed: ${error.message}`);
+    } finally {
+        isDisconnecting = false;
     }
 });
 
@@ -1065,7 +1070,7 @@ function checkStreamStatus() {
                 // The server knows the protocol, e.g. when this page was reloaded while connected
                 if (data.protocol) selectedProtocol = data.protocol;
                 handleConnectionSuccess();
-            } else if (!data.connected && isConnected) {
+            } else if (!data.connected && isConnected && !isDisconnecting) {
                 handleDisconnection();
             }
         })
