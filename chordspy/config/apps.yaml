@@ -1,3 +1,13 @@
+# App tile template:
+#
+#   - title: "App Name"
+#     icon: "fa-icon-name"        # Font Awesome icon class
+#     color: "cyan"               # Tailwind colour name
+#     script: "module_name"       # Python module in chordspy/ to launch
+#     description: "Short description shown on the tile."
+#     category: "EEG"             # ECG / EMG / EOG / EEG / Tools
+#     experimental: true          # Optional: shows an "Experimental" badge on the top-right of the tile
+
 apps:
   - title: "ECG with Heart Rate"
     icon: "fa-heartbeat"
@@ -69,9 +79,10 @@ apps:
     description: "Decode EOG Signals into Alphabets based on Morse Code."
     category: "EOG"
 
-  - title: "EMG Weighing Scale (Experimental)"
+  - title: "EMG Weighing Scale"
     icon: "fa-weight-scale"
     color: "indigo"
     script: "emgweighing"
     description: "Estimate the weight of a held object from EMG envelope after a quick calibration."
     category: "EMG"
+    experimental: true

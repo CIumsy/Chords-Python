@@ -78,6 +78,19 @@ async function initializeApplication() {
     }
 }
 
+// Soft amber tag shown on the top-right of a tile for experimental apps.
+// To use it, add `experimental: true` to the app's entry in config/apps.yaml.
+const EXPERIMENTAL_BADGE = `
+    <span class="absolute top-3 right-3 z-10 will-change-transform inline-flex items-center gap-1.5 px-2 py-0.5 rounded-lg border text-xs font-medium bg-amber-50 border-amber-200 text-amber-700 dark:bg-amber-500/10 dark:border-amber-500/30 dark:text-amber-300 select-none"
+          title="This app is experimental. Results may be inaccurate and features may change.">
+        <i class="fas fa-flask"></i>Experimental
+    </span>
+`;
+
+function renderTileBadge(app) {
+    return app.experimental === true ? EXPERIMENTAL_BADGE : '';
+}
+
 // Render apps to the grid with improved card design
 function renderApps(apps) {
     const appGrid = document.getElementById('app-grid');
@@ -101,6 +114,7 @@ function renderApps(apps) {
         
         card.innerHTML = `
             <div class="relative h-full flex flex-col">
+                ${renderTileBadge(app)}
                 <div class="w-full h-32 bg-${app.color}-500/10 dark:bg-${app.color}-500/20 rounded-t-lg flex items-center justify-center transition-all duration-300 group-hover:opacity-90">
                     <i class="fas ${app.icon} text-4xl text-${app.color}-600 dark:text-${app.color}-400"></i>
                 </div>
