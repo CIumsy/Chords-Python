@@ -1,11 +1,15 @@
 """
 EMG Weighing Scale - Estimate the weight of a held object from the EMG envelope after a quick calibration.
 
-Calibration records the envelope with an empty hand or empty container (E_rest), then while holding 1 to 5 objects
-of known mass M_i (E_i). The model
+Calibration records the envelope with the arm supported and the hand fully relaxed (E_relaxed, the noise floor of the
+electrodes), then in the lifting position with an empty hand or empty container (E_rest), then while holding 3 to 5
+objects of known mass M_i (E_i). The model
     W = A * (E - E_rest) ** p
-is fitted to those points (fixed p = WEIGHT_EXPONENT for one weight, least-squares log-log fit for two or more),
-and a held object is weighed by recording its envelope level E.
+is fitted to those points with a least-squares log-log fit. E_relaxed is not part of the model: it is used to check the
+signal quality (heaviest known weight against the noise floor).
+
+Weighing an object takes two recordings: first the empty hand in position again (tare, E_tare), then the object (E).
+The weight is A * (E - E_tare) ** p, so the zero point follows any drift of the baseline since calibration.
 
 The signal pipeline reproduces Chords-Web, which the weight formula was validated on: the exact biquad filters of
 src/components/filters.tsx (mains band-stop notch, then the EMG 70 Hz high-pass) run sample by sample, followed by the
@@ -15,13 +19,18 @@ never change retroactively.
 Each hold is analysed in 1-second chunks after a settling period: the step value is the median chunk average and the
 stability is the spread of the chunk averages. Every recording is saved to a CSV in ChordsPy/weighing_logs in the
 user's home folder for debugging.
+
+The side panel shows every step as a row with its own Record / Retake button. Steps are recorded in order, any recorded
+step can be retaken, and cancelling a recording only stops that step. The banner at the top of the panel shows what to
+do next, the countdown and progress while recording, and the weighing result.
 """
 import csv
 import math
 from datetime import datetime
 from pathlib import Path
 import numpy as np
-from PyQt5.QtWidgets import (QVBoxLayout, QHBoxLayout, QMainWindow, QWidget, QLabel, QComboBox, QPushButton, QLineEdit, QProgressBar, QFrame)
+from PyQt5.QtWidgets import (QVBoxLayout, QHBoxLayout, QMainWindow, QWidget, QLabel, QComboBox, QPushButton, QLineEdit, QProgressBar, QFrame,
+                             QMessageBox)
 from PyQt5.QtCore import Qt
 from pyqtgraph import PlotWidget
 import pyqtgraph as pg
@@ -30,7 +39,7 @@ import sys
 import time
 
 # Constants
-WEIGHT_EXPONENT = 0.8          # Default exponent p (used for one known weight, or when the fit is unreliable)
+WEIGHT_EXPONENT = 0.8          # Default exponent p (used when the fitted exponent is implausible)
 P_MIN = 0.5                    # Smallest fitted exponent accepted
 P_MAX = 1.5                    # Largest fitted exponent accepted
 COUNTDOWN_SECONDS = 3          # Countdown before each recording so the user can get into position
@@ -39,13 +48,18 @@ SETTLE_SECONDS = 8             # First seconds of each recording discarded (pick
 CHUNK_SECONDS = 1              # The analysed part is averaged in chunks of this length
 MOVING_AVERAGE_SECONDS = 2     # Window of the live moving average drawn over the envelope
 STABILITY_LIMIT = 0.15         # Maximum std/mean of the 1-second chunk averages before asking the user to repeat
-REST_MOVEMENT_FACTOR = 2.0     # Empty-hand step: a chunk above this many times the median chunk means the arm moved
+REST_MOVEMENT_FACTOR = 2.0     # No-load steps: a chunk above this many times the median chunk means the arm moved
 ENVELOPE_SAMPLES = 64          # Envelope window in samples (Chords-Web RepForge EnvelopeFilter)
 MIN_KNOWN_RATIO = 1.5          # Every E_i must be at least this many times E_rest
 MIN_KNOWN_MASS_KG = 0.5        # Smallest accepted known calibration mass
+MIN_KNOWN_WEIGHTS = 3          # Fewest known weights: with only two, the fit passes through them exactly and has no error check
 MAX_KNOWN_WEIGHTS = 5          # Most known weights used in one calibration
+MIN_SIGNAL_TO_NOISE = 5.0      # Warn when the heaviest known weight's envelope is below this many times E_relaxed
+TARE_CHANGE_LIMIT = 0.3        # Warn when the tare baseline differs from the calibration E_rest by more than this fraction
 ABOVE_RANGE_FACTOR = 1.5       # Warn when a prediction exceeds this many times the largest calibrated mass
 ESTIMATE_RANGE = 0.15          # The weight is shown as a range: estimate minus/plus this fraction of it
+REST_SECONDS = 60              # Suggested rest between holds, counted by the rest timer in the banner
+BANNER_HEIGHT = 150            # Fixed banner height, so the step list below never moves
 DISPLAY_DURATION = 10          # Seconds of signal shown in the plots (same as EMG with Envelope)
 HIGH_PASS_CUTOFF = 70.0        # EMG high-pass cutoff in Hz (Chords-Web EMG filter)
 LOG_DIR = Path.home() / "ChordsPy" / "weighing_logs"   # Debug CSVs of every calibration step and weigh (user folder: always writable)
@@ -69,34 +83,32 @@ MAINS_NOTCH = {      # Notch types 1 and 2: band-stop 48-52 Hz (50 Hz mains) and
 }
 
 # Session phases
-PHASE_IDLE = "idle"            # Nothing in progress
-PHASE_READY = "ready"          # Instructions/inputs shown, waiting for Start/Continue/Retry
+PHASE_IDLE = "idle"            # Waiting for the user to record a step
 PHASE_COUNTDOWN = "countdown"  # Countdown before recording
 PHASE_RECORDING = "recording"  # Envelope is being recorded
 
-# Session steps
-STEP_SETUP = "setup"           # Calibration setup: entering the known weights
-STEP_REST = "rest"             # Calibration: empty hand / empty container
+# Step kinds
+STEP_RELAXED = "relaxed"       # Calibration: arm supported, hand fully relaxed (noise floor)
+STEP_REST = "rest"             # Calibration: empty hand / empty container in position (zero point)
 STEP_KNOWN = "known"           # Calibration: one known weight
+STEP_TARE = "tare"             # Weighing: empty hand / empty container in position, just before the object
 STEP_WEIGH = "weigh"           # Weighing an unknown object
+NO_LOAD_STEPS = (STEP_RELAXED, STEP_REST, STEP_TARE)   # Steps recorded without any object in the hand
+HOLD_STEPS = (STEP_KNOWN, STEP_WEIGH)                   # Steps holding a weight: the rest timer is shown before them
 
-INSTRUCTIONS = [
-    "Keep the same electrode placement for calibration and weighing. Do not remove or adjust electrodes.",
-    "Hold the object in your palm with the same grip every time.",
-    "Keep the same arm posture: upper arm by your side, elbow at about 120 degrees.",
-    "Keep your hand and arm still while recording.",
-    "Do not rest your arm on anything. If you must use support, use the exact same support for calibration and all objects.",
-    "Rest about 1 minute between holds to avoid fatigue.",
-    "Breathe normally and avoid talking or tensing other muscles.",
-]
-
-CONTAINER_NOTE = ("You can hold an empty container or bag during this step. Then place each known weight, and later the "
-                  "unknown object, inside the same container so the grip stays identical. All masses you enter and all "
-                  "results will be the contents only, since the container is part of the baseline.")
+TIPS = "Same grip · same arm posture · keep still · rest about 1 min between holds"
 
 COLOR_TEXT = "#222222"
-COLOR_OK = "#1e8449"
-COLOR_WARN = "#c0392b"
+COLOR_OK = "#1e8449"           # Done ticks and results
+COLOR_ACCENT = "#2471a3"       # Next step, recording and primary buttons
+COLOR_MUTED = "#9e9e9e"        # Secondary text and locked steps
+COLOR_WARN = "#b9770e"         # Steps that need a retake
+COLOR_ERROR = "#c0392b"        # Invalid mass entries
+BANNER_STYLES = {              # (background, border, title colour)
+    "info": ("#eaf2fb", "#aed6f1", COLOR_ACCENT),
+    "warn": ("#fef5e7", "#f5cba7", COLOR_WARN),
+}
+PRIMARY_BUTTON_STYLE = f"QPushButton {{ background: {COLOR_ACCENT}; color: white; border: none; border-radius: 4px; padding: 4px; }}"
 
 class Biquad:
     """One second-order filter section, in the same direct form as Chords-Web filters.tsx:
@@ -129,12 +141,32 @@ class EnvelopeFilter:
         self.index = (self.index + 1) % self.size
         return self.sum / self.size
 
+class Step:
+    """One recording step, shown as a row in the side panel."""
+    def __init__(self, kind, title):
+        self.kind = kind               # STEP_RELAXED / STEP_REST / STEP_KNOWN / STEP_TARE / STEP_WEIGH
+        self.title = title             # Row label (known weights show a mass entry instead)
+        self.value = None              # Median envelope of the accepted recording (None until recorded)
+        self.stability = None
+        # Row widgets (set by EMGWeighingScale.build_row)
+        self.row = self.icon = self.name_label = self.mass_input = self.value_label = self.button = self.remove_button = None
+
+    def mass(self):
+        # Entered mass in kg, or None when the entry is empty or not a number
+        if self.mass_input is None:
+            return None
+        try:
+            mass = float(self.mass_input.text().strip())
+        except ValueError:
+            return None
+        return mass if math.isfinite(mass) else None
+
 class EMGWeighingScale(QMainWindow):
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle("EMG Weighing Scale (Experimental)")
-        self.setGeometry(100, 100, 1200, 700)
+        self.setGeometry(100, 100, 1240, 720)
 
         self.stream_active = True   # Flag to check if the stream is active
         self.last_data_time = None  # Variable to store the last data time
@@ -186,34 +218,39 @@ class EMGWeighingScale(QMainWindow):
         self.envelope_data = np.zeros(self.buffer_size)
         self.average_data = np.zeros(self.buffer_size)
 
-        # Calibration result (set by complete_calibration)
+        # Steps, in the order they are recorded (known weight steps are added by add_known_step)
+        self.cal_steps = [Step(STEP_RELAXED, "Relaxed hand"), Step(STEP_REST, "Empty hand")]
+        self.weigh_steps = [Step(STEP_TARE, "Tare (empty hand)"), Step(STEP_WEIGH, "Object")]
+
+        # Calibration result (set by evaluate_calibration)
         self.calibrated = False
-        self.e_rest = None
         self.cal_masses = None         # Known masses in ascending order
         self.cal_envelopes = None      # Envelope value E_i for each known mass
         self.fit_p = None
         self.fit_a = None
         self.fit_reliable = True
-
-        # Calibration in progress
-        self.pending_rest = None
-        self.pending_masses = []
-        self.pending_envelopes = []
-        self.known_index = 0           # Index into pending_masses of the weight being recorded
+        self.problems = {}             # Step -> message, for recorded known weights that need a retake
+        self.mass_errors = {}          # Step -> message, for invalid mass entries
 
         # Session state
         self.phase = PHASE_IDLE
-        self.step = None
+        self.active = None             # Step being counted down or recorded
         self.countdown_end = 0.0
+        self.notice = None             # (style, title, text, button text, action) shown in the banner until the next action
+        self.last_hold_end = None      # When the last recording finished (for the rest timer)
         self.recorded = []             # Envelope chunks recorded in the current step
         self.recorded_raw = []         # Raw and filtered chunks of the same recording (for the debug CSV)
         self.recorded_filtered = []
         self.recorded_count = 0
         self.record_target = RECORD_SECONDS * self.sampling_rate
+        self.banner_action = None      # Called by the banner button
+        self.banner_step = None        # Step whose rest timer is shown in the banner
 
         self.init_ui()
+        for _ in range(MIN_KNOWN_WEIGHTS):
+            self.add_known_step()
         self.reset_signal_state()
-        self.show_idle("Press Calibrate to begin.")
+        self.refresh()
 
         # Timer for plot update
         self.timer = pg.QtCore.QTimer()
@@ -223,9 +260,10 @@ class EMGWeighingScale(QMainWindow):
     # UI
     def init_ui(self):
         central_widget = QWidget()
+        central_widget.setStyleSheet("QWidget { font-size: 13px; }")
         main_layout = QVBoxLayout(central_widget)
 
-        # Top controls: channel, notch and session buttons
+        # Top controls: channel and notch
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Channel:"))
         self.channel_combo = QComboBox()
@@ -242,19 +280,6 @@ class EMGWeighingScale(QMainWindow):
         self.notch_combo.currentIndexChanged.connect(self.on_notch_changed)
         controls.addWidget(self.notch_combo)
         controls.addStretch()
-
-        self.calibrate_button = QPushButton("Calibrate")
-        self.calibrate_button.clicked.connect(self.start_calibration)
-        controls.addWidget(self.calibrate_button)
-
-        self.weigh_button = QPushButton("Weigh")
-        self.weigh_button.setEnabled(False)   # Enabled once calibration is done
-        self.weigh_button.clicked.connect(self.start_weighing)
-        controls.addWidget(self.weigh_button)
-
-        self.reset_button = QPushButton("Reset calibration")
-        self.reset_button.clicked.connect(self.reset_calibration)
-        controls.addWidget(self.reset_button)
         main_layout.addLayout(controls)
 
         body = QHBoxLayout()
@@ -300,171 +325,313 @@ class EMGWeighingScale(QMainWindow):
         plots_layout.addWidget(self.envelope_plot)
         body.addLayout(plots_layout, stretch=3)
 
-        # Right: status/instruction panel
-        self.status_frame = QFrame()
-        self.status_frame.setFrameShape(QFrame.StyledPanel)
-        status_layout = QVBoxLayout(self.status_frame)
+        # Right: banner, calibration steps and weighing steps
+        panel = QFrame()
+        panel.setFrameShape(QFrame.StyledPanel)
+        panel.setMinimumWidth(440)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(12, 12, 12, 12)
+        panel_layout.setSpacing(4)
 
-        self.step_label = QLabel()
-        self.step_label.setWordWrap(True)
-        self.step_label.setStyleSheet("font-size: 18px; font-weight: bold;")
-        status_layout.addWidget(self.step_label)
+        panel_layout.addWidget(self.build_banner())
+        panel_layout.addSpacing(10)
 
-        self.big_label = QLabel()
-        self.big_label.setAlignment(Qt.AlignCenter)
-        status_layout.addWidget(self.big_label)
+        self.cal_count_label = QLabel()
+        self.cal_count_label.setStyleSheet(f"color: {COLOR_MUTED};")
+        self.reset_button = self.link_button("Reset")
+        self.reset_button.clicked.connect(self.reset_calibration)
+        panel_layout.addLayout(self.section_header("Calibrate", self.cal_count_label, self.reset_button))
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, self.record_target)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.hide()
-        status_layout.addWidget(self.progress_bar)
+        self.cal_rows_layout = QVBoxLayout()
+        self.cal_rows_layout.setSpacing(2)
+        panel_layout.addLayout(self.cal_rows_layout)
+        for step in self.cal_steps:
+            self.cal_rows_layout.addWidget(self.build_row(step))
 
-        self.info_label = QLabel()
-        self.info_label.setWordWrap(True)
-        self.info_label.setTextFormat(Qt.RichText)
-        self.info_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.info_label.setStyleSheet("font-size: 13px;")
-        status_layout.addWidget(self.info_label)
+        self.add_weight_button = self.link_button("+ Add weight")
+        self.add_weight_button.setStyleSheet(self.add_weight_button.styleSheet() + " text-align: left; padding-left: 28px;")
+        self.add_weight_button.clicked.connect(lambda: (self.add_known_step(), self.refresh()))
+        panel_layout.addWidget(self.add_weight_button, alignment=Qt.AlignLeft)
 
-        # Known weights setup (calibration setup only): list of mass entries + Add weight button
-        self.weights_panel = QWidget()
-        weights_layout = QVBoxLayout(self.weights_panel)
-        weights_layout.setContentsMargins(0, 0, 0, 0)
-        self.weights_list_layout = QVBoxLayout()
-        weights_layout.addLayout(self.weights_list_layout)
-        self.add_weight_button = QPushButton("Add weight")
-        self.add_weight_button.clicked.connect(lambda: self.add_weight_row())
-        weights_layout.addWidget(self.add_weight_button, alignment=Qt.AlignLeft)
-        self.weights_error_label = QLabel()
-        self.weights_error_label.setWordWrap(True)
-        self.weights_error_label.setStyleSheet(f"color: {COLOR_WARN};")
-        weights_layout.addWidget(self.weights_error_label)
-        self.weights_panel.hide()
-        status_layout.addWidget(self.weights_panel)
+        self.fit_label = QLabel()   # Fit error and signal to noise (per-weight table in the tooltip)
+        self.fit_label.setStyleSheet(f"color: {COLOR_MUTED}; padding-left: 6px;")
+        panel_layout.addWidget(self.fit_label)
+        self.quality_label = QLabel()   # Signal quality warnings
+        self.quality_label.setWordWrap(True)
+        self.quality_label.setStyleSheet(f"color: {COLOR_WARN}; padding-left: 6px;")
+        panel_layout.addWidget(self.quality_label)
+        panel_layout.addSpacing(10)
 
-        self.weight_rows = []   # (row widget, label, mass input, error label) for each known weight entry
-        self.add_weight_row()   # Start with exactly one entry
+        self.weigh_another_button = self.link_button("Weigh another")
+        self.weigh_another_button.clicked.connect(self.weigh_another)
+        panel_layout.addLayout(self.section_header("Weigh", None, self.weigh_another_button))
+        for step in self.weigh_steps:
+            panel_layout.addWidget(self.build_row(step))
 
-        # Start / Continue / Retry / Cancel button for the current step
-        self.action_button = QPushButton("Start")
-        self.action_button.setStyleSheet("font-size: 16px; padding: 6px;")
-        self.action_button.clicked.connect(self.on_action_clicked)
-        self.action_button.hide()
-        status_layout.addWidget(self.action_button)
-        status_layout.addStretch()
+        panel_layout.addStretch()
+        tips = QLabel(TIPS)
+        tips.setWordWrap(True)
+        tips.setStyleSheet(f"color: {COLOR_MUTED}; font-size: 12px;")
+        panel_layout.addWidget(tips)
 
-        body.addWidget(self.status_frame, stretch=2)
+        body.addWidget(panel, stretch=2)
         main_layout.addLayout(body)
         self.setCentralWidget(central_widget)
 
-    def add_weight_row(self):
-        if len(self.weight_rows) >= MAX_KNOWN_WEIGHTS:
+    @staticmethod
+    def link_button(text):
+        button = QPushButton(text)
+        button.setFlat(True)
+        button.setCursor(Qt.PointingHandCursor)
+        button.setStyleSheet(f"color: {COLOR_ACCENT};")
+        return button
+
+    @staticmethod
+    def section_header(title, info_label, button):
+        header = QHBoxLayout()
+        label = QLabel(title.upper())
+        label.setStyleSheet(f"font-weight: bold; color: {COLOR_TEXT}; letter-spacing: 1px;")
+        header.addWidget(label)
+        header.addStretch()
+        if info_label is not None:
+            header.addWidget(info_label)
+        header.addWidget(button)
+        return header
+
+    def build_banner(self):
+        # Fixed-height box at the top of the panel: next step, countdown, recording progress, problems or the result
+        self.banner = QFrame()
+        self.banner.setObjectName("banner")
+        self.banner.setFixedHeight(BANNER_HEIGHT)
+        layout = QVBoxLayout(self.banner)
+        layout.setContentsMargins(12, 8, 12, 10)
+        layout.setSpacing(4)
+
+        self.banner_title = QLabel()
+        self.banner_big = QLabel()
+        self.banner_big.setAlignment(Qt.AlignCenter)
+        self.banner_body = QLabel()
+        self.banner_body.setWordWrap(True)
+        self.banner_progress = QProgressBar()
+        self.banner_progress.setRange(0, self.record_target)
+        self.banner_progress.setTextVisible(False)
+        self.banner_progress.setFixedHeight(10)
+
+        bottom = QHBoxLayout()
+        self.banner_hint = QLabel()
+        self.banner_hint.setWordWrap(True)
+        self.banner_button = QPushButton()
+        self.banner_button.setFixedWidth(90)
+        self.banner_button.clicked.connect(lambda: self.banner_action and self.banner_action())
+        bottom.addWidget(self.banner_hint, stretch=1)
+        bottom.addWidget(self.banner_button, alignment=Qt.AlignBottom)
+
+        layout.addWidget(self.banner_title)
+        layout.addStretch()
+        layout.addWidget(self.banner_big)
+        layout.addWidget(self.banner_body)
+        layout.addWidget(self.banner_progress)
+        layout.addStretch()
+        layout.addLayout(bottom)
+        return self.banner
+
+    def build_row(self, step, removable=False):
+        row = QFrame()
+        row.setObjectName("stepRow")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(6, 3, 6, 3)
+        layout.setSpacing(8)
+
+        step.icon = QLabel()
+        step.icon.setFixedWidth(16)
+        layout.addWidget(step.icon)
+        if step.kind == STEP_KNOWN:
+            step.mass_input = QLineEdit()
+            step.mass_input.setFixedWidth(60)
+            step.mass_input.setAlignment(Qt.AlignRight)
+            step.mass_input.setPlaceholderText("mass")
+            step.mass_input.textChanged.connect(self.refresh)
+            layout.addWidget(step.mass_input)
+            layout.addWidget(QLabel("kg"))
+        else:
+            step.name_label = QLabel(step.title)
+            layout.addWidget(step.name_label)
+        layout.addStretch()
+
+        step.value_label = QLabel()
+        layout.addWidget(step.value_label)
+        step.button = QPushButton()
+        step.button.setFixedWidth(76)
+        step.button.clicked.connect(lambda: self.on_row_button(step))
+        layout.addWidget(step.button)
+
+        # Known weights beyond the required ones can be removed; every row keeps the slot so the columns line up
+        step.remove_button = QPushButton("✕" if removable else "")
+        step.remove_button.setFlat(True)
+        step.remove_button.setFixedWidth(22)
+        step.remove_button.setStyleSheet(f"color: {COLOR_MUTED};")
+        step.remove_button.setEnabled(removable)
+        step.remove_button.setToolTip("Remove this weight" if removable else "")
+        step.remove_button.clicked.connect(lambda: self.remove_known_step(step))
+        layout.addWidget(step.remove_button)
+
+        step.row = row
+        return row
+
+    def add_known_step(self):
+        known = self.known_steps()
+        if len(known) >= MAX_KNOWN_WEIGHTS:
             return
-        row = QWidget()
-        row_layout = QVBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        input_layout = QHBoxLayout()
-        label = QLabel()
-        mass_input = QLineEdit()
-        mass_input.setPlaceholderText(f"kg (minimum {MIN_KNOWN_MASS_KG})")
-        mass_input.textChanged.connect(self.validate_weight_entries)
-        input_layout.addWidget(label)
-        input_layout.addWidget(mass_input)
-        if self.weight_rows:   # Every entry except the first can be removed
-            remove_button = QPushButton("Remove")
-            remove_button.clicked.connect(lambda _, r=row: self.remove_weight_row(r))
-            input_layout.addWidget(remove_button)
-        row_layout.addLayout(input_layout)
-        error_label = QLabel()   # Shows why this entry is invalid
-        error_label.setStyleSheet(f"color: {COLOR_WARN};")
-        error_label.hide()
-        row_layout.addWidget(error_label)
-        self.weights_list_layout.addWidget(row)
-        self.weight_rows.append((row, label, mass_input, error_label))
-        self.refresh_weight_rows()
+        step = Step(STEP_KNOWN, f"Known weight {len(known) + 1}")
+        self.cal_steps.append(step)
+        self.cal_rows_layout.addWidget(self.build_row(step, removable=len(known) >= MIN_KNOWN_WEIGHTS))
 
-    def remove_weight_row(self, row):
-        self.weight_rows = [entry for entry in self.weight_rows if entry[0] is not row]
-        self.weights_list_layout.removeWidget(row)
-        row.deleteLater()
-        self.refresh_weight_rows()
+    def remove_known_step(self, step):
+        if self.phase != PHASE_IDLE or step not in self.cal_steps:
+            return
+        self.cal_steps.remove(step)
+        self.cal_rows_layout.removeWidget(step.row)
+        step.row.setParent(None)     # Detach now: a removed row must not stay drawn until it is deleted
+        step.row.deleteLater()
+        self.refresh()
 
-    def refresh_weight_rows(self):
-        for i, (_, label, _, _) in enumerate(self.weight_rows):
-            label.setText(f"Known weight {i+1} (kg):")
-        self.add_weight_button.setEnabled(len(self.weight_rows) < MAX_KNOWN_WEIGHTS)
-        self.validate_weight_entries()
-
-    def validate_weight_entries(self):
-        # Check every entry as it is typed: numbers >= MIN_KNOWN_MASS_KG and no duplicates.
-        # Invalid entries are marked, and Start stays disabled until all entries are valid.
-        # Returns the masses in ascending order, or None if any entry is missing or invalid.
-        masses = []
-        all_valid = True
-        for _, _, mass_input, error_label in self.weight_rows:
-            text = mass_input.text().strip()
-            try:
-                mass = float(text)
-            except ValueError:
-                mass = None
-            if not text:
-                message = ""   # Not filled in yet: block Start without flagging it
-            elif mass is None or not math.isfinite(mass):
-                message = f"Invalid: enter a number (minimum {MIN_KNOWN_MASS_KG} kg)"
-            elif mass < MIN_KNOWN_MASS_KG:
-                message = f"Invalid: minimum {MIN_KNOWN_MASS_KG} kg required"
-            else:
-                message = None
-                masses.append(mass)
-            if message is not None:
-                all_valid = False
-            error_label.setText(message or "")
-            error_label.setVisible(bool(message))
-            mass_input.setStyleSheet(f"border: 1px solid {COLOR_WARN};" if message else "")
-
-        duplicates = all_valid and len({round(m, 3) for m in masses}) != len(masses)
-        self.weights_error_label.setText("Known weights must all be different." if duplicates else "")
-        valid = all_valid and not duplicates
-        if self.step == STEP_SETUP:
-            self.action_button.setEnabled(valid)
-        return sorted(masses) if valid else None
+    def known_steps(self):
+        return [step for step in self.cal_steps if step.kind == STEP_KNOWN]
 
     def update_emg_title(self):
         self.emg_plot.setTitle(f"Filtered EMG Signal (High Pass:{int(HIGH_PASS_CUTOFF)} Hz, Notch:{self.notch_freq} Hz)")
 
-    def set_status(self, step_text, big_text="", info_html="", big_color=COLOR_TEXT):
-        self.step_label.setText(step_text)
-        self.big_label.setText(big_text)
-        self.big_label.setStyleSheet(f"font-size: 44px; font-weight: bold; color: {big_color};")
-        self.big_label.setVisible(bool(big_text))
-        self.info_label.setText(info_html)
+    # Step texts
+    def step_name(self, step):
+        if step.kind == STEP_KNOWN:
+            mass = step.mass()
+            return f"Known weight {mass:.2f} kg" if mass is not None else f"Known weight {self.known_steps().index(step) + 1}"
+        return {STEP_RELAXED: "Relaxed hand", STEP_REST: "Empty hand", STEP_TARE: "Tare", STEP_WEIGH: "Object"}[step.kind]
 
-    def show_action(self, text):
-        self.action_button.setText(text)
-        self.action_button.setEnabled(True)
-        self.action_button.show()
+    def step_heading(self, step):
+        if step in self.cal_steps:
+            return f"Step {self.cal_steps.index(step) + 1} of {len(self.cal_steps)} · {self.step_name(step)}"
+        return f"Weigh · Step {self.weigh_steps.index(step) + 1} of 2 · {self.step_name(step)}"
 
-    def set_busy(self, busy):
-        # Lock controls that would disturb a countdown/recording in progress
-        self.calibrate_button.setEnabled(not busy)
-        self.reset_button.setEnabled(not busy)
-        self.channel_combo.setEnabled(not busy)
-        self.notch_combo.setEnabled(not busy)
-        self.weigh_button.setEnabled(not busy and self.calibrated)
+    def step_instruction(self, step):
+        if step.kind == STEP_RELAXED:
+            return "Rest your forearm on a table or your lap, hand open and fully relaxed."
+        if step.kind == STEP_REST:
+            return "Get into position with an empty hand (or the empty container)."
+        if step.kind == STEP_KNOWN:
+            return f"Pick up the {step.mass():.2f} kg weight and hold it in position."
+        if step.kind == STEP_TARE:
+            return "Get into position with an empty hand (or the same empty container)."
+        return "Pick up the object and hold it in position."
 
-    def instructions_html(self):
-        items = "".join(f"<li>{text}</li>" for text in INSTRUCTIONS)
-        return f"<p><b>Before you start:</b></p><ul>{items}</ul>"
+    def step_hint(self, step):
+        if step.kind == STEP_RELAXED:
+            return "Measures the electrode noise floor"
+        if step.kind == STEP_REST:
+            return "Using a container? Results will be the contents only"
+        if step.kind == STEP_TARE:
+            return "Re-zeros the scale before weighing"
+        return self.rest_text()
 
-    def calibration_html(self):
-        # Short calibration summary for the idle and weighing screens
-        masses = ", ".join(f"{m:.2f}" for m in self.cal_masses)
-        return (f"<p>E_rest = {self.e_rest:.1f}<br>Known weights: {masses} kg<br>"
-                f"p = {self.fit_p:.3f}, A = {self.fit_a:.4g}</p>")
+    def rest_text(self):
+        # Rest timer since the last recording (shown before steps that hold a weight)
+        if self.last_hold_end is None:
+            return ""
+        rested = int(time.time() - self.last_hold_end)
+        target = f"{REST_SECONDS // 60}:{REST_SECONDS % 60:02d}"
+        if rested >= REST_SECONDS:
+            return f"Rested {target} ✓"
+        return f"Rested {rested // 60}:{rested % 60:02d} of {target}"
 
-    def results_html(self):
-        # Results table shown after calibration: known mass, envelope, predicted mass and error
+    # Calibration state
+    def evaluate_calibration(self):
+        # Validate the mass entries and recorded known weights, and fit the model once every calibration step is
+        # recorded and valid. Sets mass_errors, problems, calibrated and the fit.
+        known = self.known_steps()
+        self.mass_errors = {}
+        masses = {}
+        for step in known:
+            text = step.mass_input.text().strip()
+            mass = step.mass()
+            masses[step] = None
+            if not text:
+                continue          # Not filled in yet: blocks the step without flagging it
+            if mass is None:
+                self.mass_errors[step] = "Enter a number in kg"
+            elif mass < MIN_KNOWN_MASS_KG:
+                self.mass_errors[step] = f"At least {MIN_KNOWN_MASS_KG} kg"
+            else:
+                masses[step] = mass
+        by_mass = {}
+        for step, mass in masses.items():
+            if mass is not None:
+                by_mass.setdefault(round(mass, 3), []).append(step)
+        for group in by_mass.values():
+            if len(group) > 1:
+                for step in group:
+                    self.mass_errors[step] = "Known weights must all be different"
+                    masses[step] = None
+
+        # Recorded known weights must be clearly above the empty hand and increase with mass
+        self.problems = {}
+        e_rest = self.cal_steps[1].value
+        if e_rest is not None:
+            for step in known:
+                if step.value is not None and step.value < MIN_KNOWN_RATIO * e_rest:
+                    self.problems[step] = (f"The signal did not rise enough (E = {step.value:.1f}, needs at least "
+                                           f"{MIN_KNOWN_RATIO:g}× the empty hand: {MIN_KNOWN_RATIO * e_rest:.1f}). "
+                                           "Use a heavier weight or check the electrodes.")
+        ordered = sorted((s for s in known if s.value is not None and masses[s] is not None and s not in self.problems),
+                         key=lambda s: masses[s])
+        for lighter, heavier in zip(ordered, ordered[1:]):
+            if heavier.value <= lighter.value:
+                self.problems[heavier] = (f"The signal did not rise above the {masses[lighter]:.2f} kg weight. "
+                                          "Rest your arm, check your grip and posture, then retake.")
+
+        self.calibrated = (all(step.value is not None for step in self.cal_steps) and not self.problems
+                           and all(masses[step] is not None for step in known))
+        if self.calibrated:
+            ordered = sorted(known, key=lambda s: masses[s])
+            self.cal_masses = np.array([masses[s] for s in ordered])
+            self.cal_envelopes = np.array([s.value for s in ordered])
+            self.fit_p, self.fit_a, self.fit_reliable = self.fit_model(self.cal_masses, self.cal_envelopes - self.e_rest)
+
+    @property
+    def e_relaxed(self):
+        return self.cal_steps[0].value
+
+    @property
+    def e_rest(self):
+        return self.cal_steps[1].value
+
+    def next_step(self):
+        # The first step not recorded yet (steps are recorded in order; weighing needs a complete calibration)
+        for step in self.cal_steps:
+            if step.value is None:
+                return step
+        if not self.calibrated:
+            return None
+        for step in self.weigh_steps:
+            if step.value is None:
+                return step
+        return None
+
+    def quality_warnings(self):
+        # Signal quality checks against the relaxed noise floor (warnings only: the model does not use E_relaxed)
+        warnings = []
+        if self.e_rest <= self.e_relaxed:
+            warnings.append("The empty hand was not above the relaxed hand: make sure your hand is fully relaxed and "
+                            "supported in step 1.")
+        snr = self.cal_envelopes.max() / self.e_relaxed if self.e_relaxed > 0 else float('inf')
+        if snr < MIN_SIGNAL_TO_NOISE:
+            warnings.append(f"Weak signal ({snr:.1f}× the noise floor, at least {MIN_SIGNAL_TO_NOISE:g}× "
+                            "recommended): check the electrodes or use heavier weights.")
+        if not self.fit_reliable:
+            warnings.append(f"Unreliable fit (exponent outside {P_MIN} to {P_MAX}): p = {WEIGHT_EXPONENT} was used.")
+        return snr, warnings
+
+    def fit_table_html(self):
+        # Tooltip of the fit line: each known weight with its envelope, predicted mass and error
         rows = ""
         errors = []
         for mass, envelope in zip(self.cal_masses, self.cal_envelopes):
@@ -473,49 +640,168 @@ class EMGWeighingScale(QMainWindow):
             errors.append(abs(error))
             rows += (f"<tr><td align='right'>{mass:.2f}</td><td align='right'>{envelope:.1f}</td>"
                      f"<td align='right'>{predicted:.2f}</td><td align='right'>{error:+.1f}%</td></tr>")
-        html = ("<table border='1' cellspacing='0' cellpadding='3'>"
-                "<tr><th>Mass (kg)</th><th>Envelope</th><th>Predicted (kg)</th><th>Error</th></tr>"
-                f"{rows}</table>")
-        html += f"<p>E_rest = {self.e_rest:.1f}<br>p = {self.fit_p:.3f}, A = {self.fit_a:.4g}"
-        if len(self.cal_masses) >= 3:
-            html += f"<br>Average error: {np.mean(errors):.1f}%"
-        html += "</p>"
-        if not self.fit_reliable:
-            html += (f"<p style='color:{COLOR_WARN}'>The fit was unreliable (exponent outside {P_MIN} to {P_MAX}), "
-                     f"so p = {WEIGHT_EXPONENT} was used and only A was fitted.</p>")
-        return html
+        table = ("<table cellspacing='0' cellpadding='3'>"
+                 "<tr><th>Mass (kg)</th><th>Envelope</th><th>Predicted (kg)</th><th>Error</th></tr>"
+                 f"{rows}</table><p>E_relaxed = {self.e_relaxed:.1f}, E_rest = {self.e_rest:.1f}<br>"
+                 f"p = {self.fit_p:.3f}, A = {self.fit_a:.4g}</p>")
+        return float(np.mean(errors)), table
 
-    def show_idle(self, message):
-        # Return to the idle state, summarising the current calibration
-        self.phase = PHASE_IDLE
-        self.step = None
-        self.action_button.hide()
-        self.weights_panel.hide()
-        self.progress_bar.hide()
-        self.set_busy(False)
+    # Refreshing the panel
+    def refresh(self):
+        # Rebuild every row and the banner from the current state
+        self.evaluate_calibration()
+        busy = self.phase != PHASE_IDLE
+        upcoming = None if busy else self.next_step()
+        for step in self.cal_steps + self.weigh_steps:
+            self.update_row(step, busy, upcoming)
+
+        done = sum(step.value is not None for step in self.cal_steps)
+        self.cal_count_label.setText(f"{done} of {len(self.cal_steps)} ✓" if self.calibrated else f"{done} of {len(self.cal_steps)} done")
         if self.calibrated:
-            self.set_status("Calibrated", "", f"<p>{message}</p>{self.calibration_html()}<p>Press <b>Weigh</b> to weigh an object.</p>")
+            average_error, table = self.fit_table_html()
+            snr, warnings = self.quality_warnings()
+            self.fit_label.setText(f"Fit error {average_error:.1f}%  ·  Signal {snr:.1f}×")
+            self.fit_label.setToolTip(table)
+            self.quality_label.setText("<br>".join(warnings))
+        self.fit_label.setVisible(self.calibrated)
+        self.quality_label.setVisible(self.calibrated and bool(self.quality_label.text()))
+
+        self.reset_button.setEnabled(not busy)
+        self.add_weight_button.setEnabled(not busy and len(self.known_steps()) < MAX_KNOWN_WEIGHTS)
+        self.weigh_another_button.setVisible(not busy and self.weigh_steps[1].value is not None)
+        self.channel_combo.setEnabled(not busy)
+        self.notch_combo.setEnabled(not busy)
+        self.update_banner()
+
+    def update_row(self, step, busy, upcoming):
+        locked = step in self.weigh_steps and not self.calibrated
+        highlight = False
+        name_color = COLOR_TEXT
+        primary = False
+        if step is self.active:
+            icon, icon_color = "●", COLOR_ACCENT
+            value, value_color = ("get ready…" if self.phase == PHASE_COUNTDOWN else "recording…"), COLOR_ACCENT
+            button, enabled, highlight = "Cancel", True, True
+        elif step.value is not None:
+            problem = step in self.problems
+            icon, icon_color = ("!", COLOR_WARN) if problem else ("✓", COLOR_OK)
+            value, value_color = f"E = {step.value:.1f}", (COLOR_WARN if problem else COLOR_MUTED)
+            button, enabled = "Retake", not busy and not locked
+        elif step is upcoming:
+            icon, icon_color = "○", COLOR_ACCENT
+            value, value_color = "", COLOR_MUTED
+            ready = step.kind != STEP_KNOWN or (step.mass() is not None and step not in self.mass_errors)
+            button, enabled, highlight, primary = "Record", ready, True, ready
         else:
-            self.set_status("Not calibrated", "", f"<p>{message}</p>")
+            icon, icon_color = "○", COLOR_MUTED
+            value, value_color = "", COLOR_MUTED
+            button, enabled, name_color = "Record", False, COLOR_MUTED
 
-    def step_title(self):
-        total = len(self.pending_masses) + 1
-        if self.step == STEP_REST:
-            return f"Calibration - Step 1 of {total}: Empty hand / empty container"
-        if self.step == STEP_KNOWN:
-            mass = self.pending_masses[self.known_index]
-            return f"Calibration - Step {self.known_index + 2} of {total}: Known weight {mass:.2f} kg"
-        if self.step == STEP_WEIGH:
-            return "Weighing"
-        return "Calibration"
+        step.icon.setText(icon)
+        step.icon.setStyleSheet(f"color: {icon_color}; font-size: 15px; font-weight: bold;")
+        step.value_label.setText(value)
+        step.value_label.setStyleSheet(f"color: {value_color};")
+        step.button.setText(button)
+        step.button.setEnabled(enabled)
+        step.button.setStyleSheet(PRIMARY_BUTTON_STYLE if primary else "")
+        step.row.setStyleSheet(f"QFrame#stepRow {{ background: {BANNER_STYLES['info'][0]}; border-radius: 4px; }}" if highlight else "")
+        if step.name_label is not None:
+            step.name_label.setStyleSheet(f"color: {name_color};")
+        if step.mass_input is not None:
+            error = self.mass_errors.get(step)
+            step.mass_input.setEnabled(not busy)
+            step.mass_input.setStyleSheet(f"border: 1px solid {COLOR_ERROR};" if error else "")
+            step.mass_input.setToolTip(error or f"Mass in kg (at least {MIN_KNOWN_MASS_KG} kg)")
+        if step.remove_button.text():
+            step.remove_button.setEnabled(not busy)
 
-    def step_prompt(self):
-        if self.step == STEP_REST:
-            return "Get into position, hand empty (or holding the empty container)"
-        if self.step == STEP_KNOWN:
-            mass = self.pending_masses[self.known_index]
-            return f"Pick up the {mass:.2f} kg known weight and hold it in position"
-        return "Pick up the object and hold it in position"
+    def set_banner(self, style, title, big="", body="", hint="", button=None, action=None, primary=True, enabled=True,
+                   progress=False, big_color=COLOR_TEXT, body_size=15, center_body=False, hint_color=COLOR_MUTED):
+        background, border, title_color = BANNER_STYLES[style]
+        self.banner.setStyleSheet(f"QFrame#banner {{ background: {background}; border: 1px solid {border}; border-radius: 6px; }}")
+        self.banner_title.setText(title)
+        self.banner_title.setStyleSheet(f"font-weight: bold; color: {title_color};")
+        self.banner_big.setText(big)
+        self.banner_big.setStyleSheet(f"font-size: 34px; font-weight: bold; color: {big_color};")
+        self.banner_big.setVisible(bool(big))
+        self.banner_body.setText(body)
+        self.banner_body.setStyleSheet(f"font-size: {body_size}px; color: {COLOR_TEXT};")
+        self.banner_body.setAlignment(Qt.AlignCenter if center_body else Qt.AlignLeft)
+        self.banner_body.setVisible(bool(body))
+        self.banner_progress.setVisible(progress)
+        self.banner_hint.setText(hint)
+        self.banner_hint.setStyleSheet(f"color: {hint_color};")
+        self.banner_button.setVisible(button is not None)
+        self.banner_button.setText(button or "")
+        self.banner_button.setEnabled(enabled)
+        self.banner_button.setStyleSheet(PRIMARY_BUTTON_STYLE if primary and enabled else "")
+        self.banner_action = action
+        self.banner_step = None
+
+    def update_banner(self):
+        step = self.active
+        if self.phase == PHASE_COUNTDOWN:
+            self.set_banner("info", self.step_heading(step), str(COUNTDOWN_SECONDS), self.step_instruction(step),
+                            button="Cancel", action=self.cancel_step, primary=False, body_size=14, center_body=True)
+            return
+        if self.phase == PHASE_RECORDING:
+            self.set_banner("info", f"Recording · {self.step_name(step)}", f"0 / {RECORD_SECONDS} s",
+                            hint="Keep your hand and arm still", button="Cancel", action=self.cancel_step,
+                            primary=False, progress=True)
+            self.banner_progress.setValue(0)
+            return
+        if self.notice:
+            style, title, text, button, action = self.notice
+            self.set_banner(style, title, body=text, body_size=14, button=button, action=action)
+            return
+
+        # A recorded known weight that needs a retake
+        problem = next((s for s in self.cal_steps if s in self.problems), None)
+        if problem:
+            self.set_banner("warn", f"Retake needed · {self.step_name(problem)}", body=self.problems[problem],
+                            body_size=14, button="Retake", action=lambda: self.start_step(problem))
+            return
+
+        upcoming = self.next_step()
+        if upcoming is not None and upcoming.kind == STEP_KNOWN and (upcoming.mass() is None or upcoming in self.mass_errors):
+            error = self.mass_errors.get(upcoming)
+            self.set_banner("info", self.step_heading(upcoming),
+                            body=f"Enter the mass of this known weight in kg (at least {MIN_KNOWN_MASS_KG} kg).",
+                            hint=error or "", hint_color=COLOR_ERROR, button="Record", enabled=False)
+            return
+        if upcoming is not None:
+            self.set_banner("info", self.step_heading(upcoming), body=self.step_instruction(upcoming),
+                            hint=self.step_hint(upcoming), button="Record", action=lambda: self.start_step(upcoming))
+            if upcoming.kind in HOLD_STEPS:
+                self.banner_step = upcoming     # Keep the rest timer ticking
+            return
+
+        if not self.calibrated:
+            # Everything is recorded but a mass entry is missing or invalid
+            bad = next((s for s in self.known_steps() if s.mass() is None or s in self.mass_errors), None)
+            message = self.mass_errors.get(bad, "Enter the mass of every known weight.") if bad else ""
+            self.set_banner("warn", "Check the known weights", body=message, body_size=14)
+            return
+        self.show_result()
+
+    def show_result(self):
+        tare, obj = self.weigh_steps[0].value, self.weigh_steps[1].value
+        weight = self.predict_weight(obj, tare)
+        notes = []
+        if obj <= tare:
+            notes.append("No load detected.")
+        elif weight > ABOVE_RANGE_FACTOR * self.cal_masses.max():
+            notes.append("Above the calibrated range: less reliable.")
+        change = tare / self.e_rest - 1
+        if abs(change) > TARE_CHANGE_LIMIT:
+            notes.append(f"Empty hand changed {change * 100:+.0f}% since calibration: recalibrate if posture or electrodes changed.")
+        if weight > 0:
+            low, high = weight * (1 - ESTIMATE_RANGE), weight * (1 + ESTIMATE_RANGE)
+            big, body = f"{low:.2f} – {high:.2f} kg", f"Estimate {weight:.2f} kg (±{ESTIMATE_RANGE * 100:.0f}%)"
+        else:
+            big, body = "0.00 kg", ""
+        self.set_banner("info", "Estimated weight", big, body, hint=" ".join(notes), big_color=COLOR_OK,
+                        body_size=13, center_body=True, hint_color=COLOR_WARN)
 
     # Signal processing
     def build_filters(self):
@@ -595,9 +881,7 @@ class EMGWeighingScale(QMainWindow):
     # Weight model
     @staticmethod
     def fit_model(masses, deltas):
-        # Fit W = A * delta ** p, where delta = E - E_rest. Returns (p, A, reliable).
-        if len(masses) == 1:
-            return WEIGHT_EXPONENT, float(masses[0] / deltas[0] ** WEIGHT_EXPONENT), True
+        # Fit W = A * delta ** p, where delta = E - E_rest (at least MIN_KNOWN_WEIGHTS points). Returns (p, A, reliable).
         p, log_a = np.polyfit(np.log(deltas), np.log(masses), 1)   # ln(W) = p * ln(delta) + ln(A)
         if P_MIN <= p <= P_MAX:
             return float(p), float(np.exp(log_a)), True
@@ -605,54 +889,29 @@ class EMGWeighingScale(QMainWindow):
         a = np.exp(np.mean(np.log(masses / deltas ** WEIGHT_EXPONENT)))
         return WEIGHT_EXPONENT, float(a), False
 
-    def predict_weight(self, envelope_value):
-        if envelope_value <= self.e_rest:
+    def predict_weight(self, envelope_value, baseline=None):
+        # baseline: the no-load level to measure from (the tare when weighing, E_rest by default)
+        baseline = self.e_rest if baseline is None else baseline
+        if envelope_value <= baseline:
             return 0.0
-        return self.fit_a * (envelope_value - self.e_rest) ** self.fit_p
+        return self.fit_a * (envelope_value - baseline) ** self.fit_p
 
     # Session flow
-    def start_calibration(self):
-        self.step = STEP_SETUP
-        self.phase = PHASE_READY
-        self.weights_panel.show()
-        self.set_status("Calibration", "", self.instructions_html() +
-                        f"<p><b>Empty hand step:</b> {CONTAINER_NOTE}</p>"
-                        f"<p>Enter 1 to {MAX_KNOWN_WEIGHTS} known weights below (at least {MIN_KNOWN_MASS_KG} kg each, all different), "
-                        "then press <b>Start</b>. Starting discards any previous calibration.</p>")
-        self.show_action("Start")
-        self.validate_weight_entries()   # Start is enabled only when every entry is valid
+    def on_row_button(self, step):
+        if step is self.active:
+            self.cancel_step()
+        else:
+            self.start_step(step)
 
-    def start_weighing(self):
-        if not self.calibrated:
+    def start_step(self, step):
+        # Record (or retake) one step: countdown, then recording
+        if self.phase != PHASE_IDLE:
             return
-        self.step = STEP_WEIGH
-        self.phase = PHASE_READY
-        self.weights_panel.hide()
-        self.set_status("Weighing", "", self.instructions_html() + "<p>Press <b>Start</b> when ready.</p>")
-        self.show_action("Start")
-
-    def on_action_clicked(self):
-        if self.phase in (PHASE_COUNTDOWN, PHASE_RECORDING):
-            self.show_idle("Cancelled.")
-            return
-        if self.phase != PHASE_READY:
-            return
-        if self.step == STEP_SETUP:
-            masses = self.validate_weight_entries()
-            if masses is None:
-                return
-            self.clear_calibration()
-            self.pending_masses = masses
-            self.weights_panel.hide()
-            self.step = STEP_REST
-        self.begin_countdown()
-
-    def begin_countdown(self):
+        self.notice = None
+        self.active = step
         self.phase = PHASE_COUNTDOWN
         self.countdown_end = time.time() + COUNTDOWN_SECONDS
-        self.set_busy(True)
-        self.show_action("Cancel")
-        self.set_status(self.step_title(), str(COUNTDOWN_SECONDS), f"<p><b>{self.step_prompt()}</b></p>")
+        self.refresh()
 
     def begin_recording(self):
         self.phase = PHASE_RECORDING
@@ -660,28 +919,33 @@ class EMGWeighingScale(QMainWindow):
         self.recorded_raw = []
         self.recorded_filtered = []
         self.recorded_count = 0
-        self.progress_bar.setValue(0)
-        self.progress_bar.show()
-        self.set_status(self.step_title(), f"0.0 / {RECORD_SECONDS} s")
+        self.refresh()
+
+    def cancel_step(self):
+        # Stop only the step in progress: every recorded step keeps its value
+        if self.phase == PHASE_IDLE:
+            return
+        self.phase = PHASE_IDLE
+        self.active = None
+        self.refresh()
 
     def update_session(self):
         if self.phase == PHASE_COUNTDOWN:
             remaining = self.countdown_end - time.time()
             if remaining > 0:
-                self.big_label.setText(str(math.ceil(remaining)))
+                self.banner_big.setText(str(math.ceil(remaining)))
             else:
                 self.begin_recording()
         elif self.phase == PHASE_RECORDING:
             if self.recorded_count >= self.record_target:
                 self.finish_recording()
                 return
-            elapsed = self.recorded_count / self.sampling_rate
-            self.big_label.setText(f"{elapsed:.1f} / {RECORD_SECONDS} s")
-            self.progress_bar.setValue(self.recorded_count)
-            if elapsed < SETTLE_SECONDS:
-                self.info_label.setText(f"<p>Recording, keep your hand and arm still.<br>Settling (first {SETTLE_SECONDS} s are not used)...</p>")
-            else:
-                self.info_label.setText("<p>Recording, keep your hand and arm still.<br>Measuring...</p>")
+            self.banner_big.setText(f"{int(self.recorded_count / self.sampling_rate)} / {RECORD_SECONDS} s")
+            self.banner_progress.setValue(self.recorded_count)
+        elif self.banner_step is not None:
+            hint = self.rest_text()
+            if self.banner_hint.text() != hint:
+                self.banner_hint.setText(hint)
 
     def analyse_segment(self, envelope):
         # Use seconds SETTLE_SECONDS..RECORD_SECONDS, averaged in 1-second chunks. Returns (value, stability, peak):
@@ -696,16 +960,15 @@ class EMGWeighingScale(QMainWindow):
         peak = float(np.max(chunks) / value) if value > 0 else float('inf')
         return value, stability, peak
 
-    def save_log(self, raw, filtered, envelope):
+    def save_log(self, step, raw, filtered, envelope):
         # Debug CSV of this recording (the whole hold, including the settling period). Returns (path, error).
-        step = {STEP_REST: 'rest', STEP_KNOWN: 'known', STEP_WEIGH: 'weigh'}[self.step]
-        if self.step == STEP_REST:
-            mass = 0.0                                          # Empty hand / empty container
-        elif self.step == STEP_KNOWN:
-            mass = self.pending_masses[self.known_index]
+        if step.kind in NO_LOAD_STEPS:
+            mass = 0.0                                          # Relaxed hand, or empty hand / empty container
+        elif step.kind == STEP_KNOWN:
+            mass = step.mass()
         else:
             mass = None                                         # Unknown object: left blank
-        stem = datetime.now().strftime('%Y%m%d-%H%M%S') + f"_{step}" + (f"_{mass:.2f}kg" if self.step == STEP_KNOWN else "")
+        stem = datetime.now().strftime('%Y%m%d-%H%M%S') + f"_{step.kind}" + (f"_{mass:.2f}kg" if step.kind == STEP_KNOWN else "")
         try:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
             path = LOG_DIR / f"{stem}.csv"
@@ -718,147 +981,80 @@ class EMGWeighingScale(QMainWindow):
                 writer.writerow(['time_s', 'raw', 'filtered', 'envelope', 'step', 'mass_kg'])
                 mass_text = '' if mass is None else f"{mass:g}"
                 for i in range(len(envelope)):
-                    writer.writerow([f"{i / self.sampling_rate:.4f}", raw[i], filtered[i], envelope[i], step, mass_text])
+                    writer.writerow([f"{i / self.sampling_rate:.4f}", raw[i], filtered[i], envelope[i], step.kind, mass_text])
             return path, None
         except OSError as e:
             return None, str(e)
 
     def finish_recording(self):
+        step = self.active
         n = self.record_target
         envelope = np.concatenate(self.recorded)[:n]
-        log_path, log_error = self.save_log(np.concatenate(self.recorded_raw)[:n], np.concatenate(self.recorded_filtered)[:n], envelope)
-        log_note = (f"<p style='color:#666666'>Log saved: {log_path}</p>" if log_path
-                    else f"<p style='color:{COLOR_WARN}'>Could not save the log: {log_error}</p>")
+        log_path, log_error = self.save_log(step, np.concatenate(self.recorded_raw)[:n], np.concatenate(self.recorded_filtered)[:n], envelope)
+        if log_error:
+            print(f"Could not save the log: {log_error}")
         value, stability, peak = self.analyse_segment(envelope)
-        self.phase = PHASE_READY
-        self.progress_bar.hide()
-        self.set_busy(False)
+        self.phase = PHASE_IDLE
+        self.active = None
+        self.last_hold_end = time.time()
 
-        # The empty-hand level is tiny, so its relative spread means little: only a clear movement fails it
-        if self.step == STEP_REST:
+        # No-load levels are small, so their relative spread means little: only a clear movement fails them
+        if step.kind in NO_LOAD_STEPS:
             unstable = peak > REST_MOVEMENT_FACTOR
-            reason = f"One second was {peak:.1f}x the typical level (limit {REST_MOVEMENT_FACTOR:g}x): the arm moved."
+            reason = f"one second was {peak:.1f}× the typical level, so the arm moved"
         else:
             unstable = stability > STABILITY_LIMIT
-            reason = f"Stability: {stability:.2f} (limit {STABILITY_LIMIT})"
+            reason = f"stability {stability:.2f}, limit {STABILITY_LIMIT}"
         if unstable:
-            # Let the user repeat the same step
-            self.set_status(self.step_title(), "Unstable",
-                            f"<p style='color:{COLOR_WARN}'><b>Signal unstable, keep your arm still and repeat.</b></p>"
-                            f"<p>Envelope: {value:.1f}<br>{reason}</p>"
-                            "<p>Rest about 1 minute, then press <b>Retry</b>.</p>" + log_note, COLOR_WARN)
-            self.show_action("Retry")
-            return
+            kept = " The previous recording was kept." if step.value is not None else ""
+            self.notice = ("warn", f"Signal unstable · {self.step_name(step)}",
+                           f"The signal varied too much ({reason}). Rest your arm, keep still, then retake.{kept}",
+                           "Retake", lambda: self.start_step(step))
+        else:
+            step.value = value
+            step.stability = stability
+        self.refresh()
 
-        if self.step == STEP_REST:
-            self.finish_rest(value, stability)
-        elif self.step == STEP_KNOWN:
-            self.finish_known(value, stability)
-        elif self.step == STEP_WEIGH:
-            self.finish_weigh(value, stability)
-        self.info_label.setText(self.info_label.text() + log_note)
+    def weigh_another(self):
+        # Clear the tare and object so the next object is weighed from a fresh tare
+        for step in self.weigh_steps:
+            step.value = None
+        self.notice = None
+        self.refresh()
 
-    def prompt_next_known(self, message):
-        mass = self.pending_masses[self.known_index]
-        self.set_status(self.step_title(), "",
-                        f"<p>{message}</p><p>Next: known weight {mass:.2f} kg.</p>"
-                        "<p><b>Rest your arm, then press Continue.</b></p>")
-        self.show_action("Continue")
-
-    def finish_rest(self, value, stability):
-        self.pending_rest = value
-        self.pending_envelopes = []
-        self.known_index = 0
-        self.step = STEP_KNOWN
-        self.prompt_next_known(f"Baseline recorded: E_rest = {value:.1f} (stability {stability:.2f}).")
-
-    def finish_known(self, value, stability):
-        i = self.known_index
-        mass = self.pending_masses[i]
-
-        # Validate this weight: clearly above rest and increasing with mass
-        problem = None
-        if value <= self.pending_rest or value < MIN_KNOWN_RATIO * self.pending_rest:
-            problem = (f"Known weight {mass:.2f} kg did not raise muscle activity enough: E = {value:.1f}, "
-                       f"needs at least {MIN_KNOWN_RATIO}x E_rest ({MIN_KNOWN_RATIO * self.pending_rest:.1f}). "
-                       "Use a heavier object or check electrodes.")
-        elif i > 0 and value <= self.pending_envelopes[i - 1]:
-            previous_mass = self.pending_masses[i - 1]
-            problem = (f"Known weight {mass:.2f} kg gave E = {value:.1f}, which is not above the "
-                       f"{previous_mass:.2f} kg weight (E = {self.pending_envelopes[i - 1]:.1f}). "
-                       "The envelope must increase with mass.")
-        if problem:
-            self.set_status(self.step_title(), "Not calibrated",
-                            f"<p style='color:{COLOR_WARN}'><b>{problem}</b></p>"
-                            "<p>Rest your arm, then press <b>Retry</b> to redo this step, "
-                            "or press <b>Calibrate</b> to start over.</p>", COLOR_WARN)
-            self.show_action("Retry")
-            return
-
-        self.pending_envelopes.append(value)
-        self.known_index += 1
-        if self.known_index < len(self.pending_masses):
-            self.prompt_next_known(f"Known weight {mass:.2f} kg recorded: E = {value:.1f} (stability {stability:.2f}).")
-            return
-        self.complete_calibration()
-
-    def complete_calibration(self):
-        self.e_rest = self.pending_rest
-        self.cal_masses = np.array(self.pending_masses)
-        self.cal_envelopes = np.array(self.pending_envelopes)
-        self.fit_p, self.fit_a, self.fit_reliable = self.fit_model(self.cal_masses, self.cal_envelopes - self.e_rest)
-        self.calibrated = True
-        self.show_idle("")
-        self.set_status("Calibration complete", "Calibrated",
-                        self.results_html() + "<p>Press <b>Weigh</b> to weigh an object.</p>", COLOR_OK)
-
-    def finish_weigh(self, value, stability):
-        weight = self.predict_weight(value)
-        low, high = weight * (1 - ESTIMATE_RANGE), weight * (1 + ESTIMATE_RANGE)
-        # Show the weight as a range around the estimate (no range when no load was detected)
-        result = f"{low:.2f} - {high:.2f} kg" if weight > 0 else "0.00 kg"
-        info = (f"<p>Estimate: {weight:.2f} kg (&plusmn;{ESTIMATE_RANGE * 100:.0f}%)</p>"
-                f"<p>Measured envelope: {value:.1f}<br>Stability: {stability:.2f}</p>")
-        if value <= self.e_rest:
-            info += "<p><b>No load detected.</b></p>"
-        elif weight > ABOVE_RANGE_FACTOR * self.cal_masses.max():
-            info += f"<p style='color:{COLOR_WARN}'>Above calibration range, estimate less reliable.</p>"
-        info += f"{self.calibration_html()}<p>Press <b>Weigh</b> to weigh another object.</p>"
-
-        self.show_idle("")
-        self.set_status("Estimated weight", result, info, COLOR_OK)
-
-    def clear_calibration(self):
-        self.calibrated = False
-        self.e_rest = None
-        self.cal_masses = None
-        self.cal_envelopes = None
-        self.fit_p = None
-        self.fit_a = None
-        self.fit_reliable = True
-        self.pending_rest = None
-        self.pending_masses = []
-        self.pending_envelopes = []
-        self.known_index = 0
-        self.weigh_button.setEnabled(False)
+    def clear_recordings(self):
+        for step in self.cal_steps + self.weigh_steps:
+            step.value = None
+            step.stability = None
+        self.notice = None
+        self.last_hold_end = None
 
     def reset_calibration(self):
-        self.clear_calibration()
-        self.show_idle("Calibration reset. Press Calibrate to begin.")
+        answer = QMessageBox.question(self, "Reset calibration", "Clear all calibration and weighing recordings?",
+                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            self.clear_recordings()
+            self.refresh()
 
     def on_channel_changed(self, index):
         self.channel = index
         self.reset_signal_state()
-        self.clear_calibration()
-        self.show_idle(f"Channel {index + 1} selected. Filters and calibration were reset. Press Calibrate to begin.")
+        self.clear_recordings()
+        self.notice = ("info", f"Channel {index + 1} selected", "Filters and calibration were reset.", "OK", self.dismiss_notice)
+        self.refresh()
 
     def on_notch_changed(self, index):
         # Calibration values depend on the exact filter chain, so they are invalidated as well
         self.notch_freq = 50 if index == 0 else 60
         self.update_emg_title()
         self.reset_signal_state()    # Rebuilds the filters with the new notch
-        self.clear_calibration()
-        self.show_idle(f"Notch set to {self.notch_freq} Hz. Filters and calibration were reset. Press Calibrate to begin.")
+        self.clear_recordings()
+        self.notice = ("info", f"Notch set to {self.notch_freq} Hz", "Filters and calibration were reset.", "OK", self.dismiss_notice)
+        self.refresh()
+
+    def dismiss_notice(self):
+        self.notice = None
+        self.refresh()
 
 def main():
     app = pg.mkQApp()    # Enables high-DPI scaling, so plots scale correctly when moved to another monitor
