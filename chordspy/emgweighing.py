@@ -31,7 +31,8 @@ from pathlib import Path
 import numpy as np
 from PyQt5.QtWidgets import (QVBoxLayout, QHBoxLayout, QMainWindow, QWidget, QLabel, QComboBox, QPushButton, QLineEdit, QProgressBar, QFrame,
                              QMessageBox)
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QPointF, QRectF
+from PyQt5.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap
 from pyqtgraph import PlotWidget
 import pyqtgraph as pg
 import pylsl
@@ -59,7 +60,6 @@ TARE_CHANGE_LIMIT = 0.3        # Warn when the tare baseline differs from the ca
 ABOVE_RANGE_FACTOR = 1.5       # Warn when a prediction exceeds this many times the largest calibrated mass
 ESTIMATE_RANGE = 0.15          # The weight is shown as a range: estimate minus/plus this fraction of it
 REST_SECONDS = 60              # Suggested rest between holds, counted by the rest timer in the banner
-BANNER_HEIGHT = 150            # Fixed banner height, so the step list below never moves
 DISPLAY_DURATION = 10          # Seconds of signal shown in the plots (same as EMG with Envelope)
 HIGH_PASS_CUTOFF = 70.0        # EMG high-pass cutoff in Hz (Chords-Web EMG filter)
 LOG_DIR = Path.home() / "ChordsPy" / "weighing_logs"   # Debug CSVs of every calibration step and weigh (user folder: always writable)
@@ -98,17 +98,143 @@ HOLD_STEPS = (STEP_KNOWN, STEP_WEIGH)                   # Steps holding a weight
 
 TIPS = "Same grip · same arm posture · keep still · rest about 1 min between holds"
 
-COLOR_TEXT = "#222222"
-COLOR_OK = "#1e8449"           # Done ticks and results
-COLOR_ACCENT = "#2471a3"       # Next step, recording and primary buttons
-COLOR_MUTED = "#9e9e9e"        # Secondary text and locked steps
+# Window look: one set of colours, sizes and control styles used by every element. Like the other Chords apps, the window
+# keeps the standard background and the plots and side panel are flat white areas. Colour is only used for accents
+# (banner header bar, active-row rail, status circles, buttons and links). No gradients anywhere.
+COLOR_TEXT = "#1f2328"
+COLOR_OK = "#1e8449"           # Done steps and results
+COLOR_ACCENT = "#2471a3"       # Next step, recording, links and primary buttons
+COLOR_ACCENT_DARK = "#1f618d"  # Primary button hover
+COLOR_MUTED = "#6b7280"        # Secondary text
 COLOR_WARN = "#b9770e"         # Steps that need a retake
 COLOR_ERROR = "#c0392b"        # Invalid mass entries
-BANNER_STYLES = {              # (background, border, title colour)
-    "info": ("#eaf2fb", "#aed6f1", COLOR_ACCENT),
-    "warn": ("#fef5e7", "#f5cba7", COLOR_WARN),
+COLOR_BORDER = "#c8ccd0"       # Buttons, entries and drop-downs
+COLOR_BORDER_DARK = "#a6acb2"  # Control hover
+COLOR_HOVER = "#f4f6f7"        # Secondary button hover background
+COLOR_DISABLED_BG = "#f4f6f7"
+COLOR_DISABLED_BORDER = "#e1e4e7"
+COLOR_DISABLED_TEXT = "#b3b7bb" # Disabled controls, locked steps and their status circles
+COLOR_TRACK = "#d6e4f0"        # Progress bar track
+COLOR_BANNER_BORDER = "#dcdfe3"  # Outline of the banner
+COLOR_DIVIDER = "#e8eaed"      # Lines between banner zones, section headers and step rows
+COLOR_FOOTER = "#f8f9fa"       # Banner footer strip
+COLOR_ROW_ACTIVE = "#e8f0f8"   # Background of the next / active step row (with an accent rail)
+BANNER_COLORS = {              # Banner header bar (white text on it)
+    "info": COLOR_ACCENT,
+    "warn": "#a8660a",         # Darker than COLOR_WARN so white text stays readable
+    "ok": COLOR_OK,
 }
-PRIMARY_BUTTON_STYLE = f"QPushButton {{ background: {COLOR_ACCENT}; color: white; border: none; border-radius: 4px; padding: 4px; }}"
+FONT_TITLE = 14                # Banner title and instructions
+FONT_SMALL = 12                # Secondary text: values, counts, hints, fit line and tips
+FONT_CAPS = 11                 # Upper-case labels: banner state label and section headers
+FONT_BIG = 32                  # Banner countdown, progress and result
+CONTROL_HEIGHT = 26            # Every button, mass entry and drop-down
+BUTTON_WIDTH = 80              # Every Record / Retake / Cancel button (rows and banner)
+GAP = 12                       # Space around and between the window's cards
+PAD = 14                       # Inner left/right padding of the banner, section headers and step rows
+ROW_HEIGHT = 38                # Every step row
+RAIL_WIDTH = 3                 # Accent rail on the left of the next / active step row
+STATUS_SIZE = 16               # Status circle at the start of each row
+ROW_SPACING = 8                # Space between the items of a row
+NAME_INDENT = PAD + STATUS_SIZE + ROW_SPACING   # Left edge of the step names: links and the fit line line up with it
+BANNER_HEIGHT = 184            # Fixed banner height, so the step list below never moves
+BANNER_HEADER_HEIGHT = 40
+BANNER_FOOTER_HEIGHT = 44
+CAPS_STYLE = f"font-size: {FONT_CAPS}px; font-weight: bold; letter-spacing: 1px;"
+WINDOW_STYLE = f"""
+QWidget {{ font-size: 13px; color: {COLOR_TEXT}; }}
+QLabel {{ background: transparent; }}
+QComboBox {{ background: white; border: 1px solid {COLOR_BORDER}; border-radius: 4px; padding: 0 28px 0 8px;
+    min-height: {CONTROL_HEIGHT - 2}px; max-height: {CONTROL_HEIGHT - 2}px; min-width: 70px; }}
+QComboBox:hover {{ border-color: {COLOR_BORDER_DARK}; }}
+QComboBox:disabled {{ background: {COLOR_DISABLED_BG}; color: {COLOR_DISABLED_TEXT}; border-color: {COLOR_DISABLED_BORDER}; }}
+QComboBox::drop-down {{ border: none; width: 24px; }}
+QComboBox QAbstractItemView {{ background: white; border: 1px solid {COLOR_BORDER}; outline: none;
+    selection-background-color: #e8f1f8; selection-color: {COLOR_TEXT}; }}
+"""
+PANEL_STYLE = f"""
+QFrame#panel {{ background: white; border: none; }}
+QFrame#section {{ background: transparent; border: 1px solid transparent; }}
+QFrame#divider {{ background: {COLOR_DIVIDER}; border: none; }}
+QPushButton[variant="primary"], QPushButton[variant="secondary"] {{
+    min-height: {CONTROL_HEIGHT - 2}px; max-height: {CONTROL_HEIGHT - 2}px; padding: 0 10px; border-radius: 4px; }}
+QPushButton[variant="primary"] {{ background: {COLOR_ACCENT}; color: white; border: 1px solid {COLOR_ACCENT}; }}
+QPushButton[variant="primary"]:hover {{ background: {COLOR_ACCENT_DARK}; border-color: {COLOR_ACCENT_DARK}; }}
+QPushButton[variant="secondary"] {{ background: white; color: {COLOR_TEXT}; border: 1px solid {COLOR_BORDER}; }}
+QPushButton[variant="secondary"]:hover {{ background: {COLOR_HOVER}; border-color: {COLOR_BORDER_DARK}; }}
+QPushButton[variant="primary"]:disabled, QPushButton[variant="secondary"]:disabled {{
+    background: {COLOR_DISABLED_BG}; color: {COLOR_DISABLED_TEXT}; border: 1px solid {COLOR_DISABLED_BORDER}; }}
+QPushButton[variant="link"] {{ background: transparent; border: none; padding: 0; color: {COLOR_ACCENT}; font-size: {FONT_SMALL}px; }}
+QPushButton[variant="link"]:hover {{ text-decoration: underline; }}
+QPushButton[variant="link"]:disabled {{ color: {COLOR_DISABLED_TEXT}; }}
+QPushButton[variant="icon"] {{ background: transparent; border: none; padding: 0; color: {COLOR_DISABLED_TEXT}; }}
+QPushButton[variant="icon"]:hover {{ color: {COLOR_TEXT}; }}
+QLineEdit {{ background: white; border: 1px solid {COLOR_BORDER}; border-radius: 4px; padding: 0 6px;
+    min-height: {CONTROL_HEIGHT - 2}px; max-height: {CONTROL_HEIGHT - 2}px; }}
+QLineEdit:focus {{ border-color: {COLOR_ACCENT}; }}
+QLineEdit:disabled {{ background: {COLOR_DISABLED_BG}; color: {COLOR_DISABLED_TEXT}; border-color: {COLOR_DISABLED_BORDER}; }}
+QLineEdit[error="true"] {{ border-color: {COLOR_ERROR}; }}
+QProgressBar {{ background: {COLOR_TRACK}; border: none; border-radius: 3px; }}
+QProgressBar::chunk {{ background: {COLOR_ACCENT}; border-radius: 3px; }}
+"""
+
+class ChevronComboBox(QComboBox):
+    """Drop-down styled like the entries. A styled QComboBox loses the native arrow, so a chevron is drawn instead."""
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        color = COLOR_MUTED if self.isEnabled() else COLOR_DISABLED_TEXT
+        painter.setPen(QPen(QColor(color), 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        x, y = self.width() - 14, self.height() / 2
+        painter.drawPolyline(QPointF(x - 4, y - 2), QPointF(x, y + 2), QPointF(x + 4, y - 2))
+        painter.end()
+
+def status_icon(kind):
+    # Round status icon for a step row, drawn (not a font glyph) so every state has the same shape and size.
+    # kind: done (green tick), problem (amber !), active (blue dot), next (blue ring), locked (grey ring)
+    ratio = 2   # Drawn at twice the size for high-DPI screens
+    pixmap = QPixmap(STATUS_SIZE * ratio, STATUS_SIZE * ratio)
+    pixmap.fill(Qt.transparent)
+    pixmap.setDevicePixelRatio(ratio)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    color = QColor({"done": COLOR_OK, "problem": COLOR_WARN, "active": COLOR_ACCENT, "next": COLOR_ACCENT,
+                    "locked": COLOR_DISABLED_TEXT}[kind])
+    circle = QRectF(1.5, 1.5, STATUS_SIZE - 3, STATUS_SIZE - 3)
+    if kind in ("next", "locked"):
+        painter.setPen(QPen(color, 1.5))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(circle)
+    else:
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(color)
+        painter.drawEllipse(circle)
+        white = QPen(QColor("white"), 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(white)
+        painter.setBrush(Qt.NoBrush)
+        middle = STATUS_SIZE / 2
+        if kind == "done":
+            tick = QPainterPath(QPointF(middle - 3.2, middle + 0.2))
+            tick.lineTo(middle - 0.8, middle + 2.6)
+            tick.lineTo(middle + 3.4, middle - 2.2)
+            painter.drawPath(tick)
+        elif kind == "problem":
+            painter.drawLine(QPointF(middle, middle - 3.5), QPointF(middle, middle + 0.8))
+            painter.drawPoint(QPointF(middle, middle + 3.4))
+        else:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("white"))
+            painter.drawEllipse(QPointF(middle, middle), 2.6, 2.6)
+    painter.end()
+    return pixmap
+
+def set_style_property(widget, name, value):
+    # Set a property used by PANEL_STYLE selectors and re-apply the style when it changes
+    if widget.property(name) != value:
+        widget.setProperty(name, value)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
 
 class Biquad:
     """One second-order filter section, in the same direct form as Chords-Web filters.tsx:
@@ -149,7 +275,8 @@ class Step:
         self.value = None              # Median envelope of the accepted recording (None until recorded)
         self.stability = None
         # Row widgets (set by EMGWeighingScale.build_row)
-        self.row = self.icon = self.name_label = self.mass_input = self.value_label = self.button = self.remove_button = None
+        self.row = self.rail = self.icon = self.name_label = self.mass_input = None
+        self.value_label = self.button = self.remove_button = None   # remove_button only on removable known weights
 
     def mass(self):
         # Entered mass in kg, or None when the entry is empty or not a number
@@ -236,7 +363,7 @@ class EMGWeighingScale(QMainWindow):
         self.phase = PHASE_IDLE
         self.active = None             # Step being counted down or recorded
         self.countdown_end = 0.0
-        self.notice = None             # (style, title, text, button text, action) shown in the banner until the next action
+        self.notice = None             # (style, label, title, text, button text, action) shown in the banner until the next action
         self.last_hold_end = None      # When the last recording finished (for the rest timer)
         self.recorded = []             # Envelope chunks recorded in the current step
         self.recorded_raw = []         # Raw and filtered chunks of the same recording (for the debug CSV)
@@ -260,13 +387,16 @@ class EMGWeighingScale(QMainWindow):
     # UI
     def init_ui(self):
         central_widget = QWidget()
-        central_widget.setStyleSheet("QWidget { font-size: 13px; }")
+        central_widget.setStyleSheet(WINDOW_STYLE)
         main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(GAP, GAP, GAP, GAP)
+        main_layout.setSpacing(GAP)
 
         # Top controls: channel and notch
         controls = QHBoxLayout()
+        controls.setSpacing(ROW_SPACING)
         controls.addWidget(QLabel("Channel:"))
-        self.channel_combo = QComboBox()
+        self.channel_combo = ChevronComboBox()
         for i in range(self.num_channels):
             self.channel_combo.addItem(f"Channel {i+1}")
         self.channel_combo.setCurrentIndex(self.channel)
@@ -275,7 +405,7 @@ class EMGWeighingScale(QMainWindow):
 
         controls.addSpacing(20)
         controls.addWidget(QLabel("Mains notch:"))
-        self.notch_combo = QComboBox()
+        self.notch_combo = ChevronComboBox()
         self.notch_combo.addItems(["50 Hz", "60 Hz"])
         self.notch_combo.currentIndexChanged.connect(self.on_notch_changed)
         controls.addWidget(self.notch_combo)
@@ -318,60 +448,67 @@ class EMGWeighingScale(QMainWindow):
         # Numeric readout of the current moving average
         self.average_label = QLabel()
         self.average_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.average_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        self.average_label.setStyleSheet(f"font-size: {FONT_TITLE}px; font-weight: bold;")
 
         plots_layout.addWidget(self.emg_plot)
         plots_layout.addWidget(self.average_label)
         plots_layout.addWidget(self.envelope_plot)
+        body.setSpacing(GAP)
         body.addLayout(plots_layout, stretch=3)
 
         # Right: banner, calibration steps and weighing steps
+        self.status_icons = {kind: status_icon(kind) for kind in ("done", "problem", "active", "next", "locked")}
         panel = QFrame()
-        panel.setFrameShape(QFrame.StyledPanel)
+        panel.setObjectName("panel")
         panel.setMinimumWidth(440)
+        panel.setStyleSheet(PANEL_STYLE)
         panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(12, 12, 12, 12)
-        panel_layout.setSpacing(4)
-
+        panel_layout.setContentsMargins(GAP, GAP, GAP, GAP)
+        panel_layout.setSpacing(GAP)
         panel_layout.addWidget(self.build_banner())
-        panel_layout.addSpacing(10)
 
+        # Calibrate: header, step rows, then the Add weight link, fit line and quality warnings
         self.cal_count_label = QLabel()
-        self.cal_count_label.setStyleSheet(f"color: {COLOR_MUTED};")
+        self.cal_count_label.setStyleSheet(f"color: {COLOR_MUTED}; font-size: {FONT_SMALL}px;")
         self.reset_button = self.link_button("Reset")
         self.reset_button.clicked.connect(self.reset_calibration)
-        panel_layout.addLayout(self.section_header("Calibrate", self.cal_count_label, self.reset_button))
-
+        calibrate, calibrate_layout = self.section("Calibrate", self.cal_count_label, self.reset_button)
         self.cal_rows_layout = QVBoxLayout()
-        self.cal_rows_layout.setSpacing(2)
-        panel_layout.addLayout(self.cal_rows_layout)
+        self.cal_rows_layout.setSpacing(0)
+        calibrate_layout.addLayout(self.cal_rows_layout)
         for step in self.cal_steps:
             self.cal_rows_layout.addWidget(self.build_row(step))
+        calibrate_layout.addWidget(self.divider())
 
+        footer = QVBoxLayout()    # Starts at the same left edge as the step names
+        footer.setContentsMargins(NAME_INDENT, 8, PAD, 0)
+        footer.setSpacing(4)
         self.add_weight_button = self.link_button("+ Add weight")
-        self.add_weight_button.setStyleSheet(self.add_weight_button.styleSheet() + " text-align: left; padding-left: 28px;")
         self.add_weight_button.clicked.connect(lambda: (self.add_known_step(), self.refresh()))
-        panel_layout.addWidget(self.add_weight_button, alignment=Qt.AlignLeft)
-
+        footer.addWidget(self.add_weight_button, alignment=Qt.AlignLeft)
         self.fit_label = QLabel()   # Fit error and signal to noise (per-weight table in the tooltip)
-        self.fit_label.setStyleSheet(f"color: {COLOR_MUTED}; padding-left: 6px;")
-        panel_layout.addWidget(self.fit_label)
+        self.fit_label.setStyleSheet(f"color: {COLOR_MUTED}; font-size: {FONT_SMALL}px;")
+        footer.addWidget(self.fit_label)
         self.quality_label = QLabel()   # Signal quality warnings
         self.quality_label.setWordWrap(True)
-        self.quality_label.setStyleSheet(f"color: {COLOR_WARN}; padding-left: 6px;")
-        panel_layout.addWidget(self.quality_label)
-        panel_layout.addSpacing(10)
+        self.quality_label.setStyleSheet(f"color: {COLOR_WARN}; font-size: {FONT_SMALL}px;")
+        footer.addWidget(self.quality_label)
+        calibrate_layout.addLayout(footer)
+        panel_layout.addWidget(calibrate)
 
+        # Weigh: header and the tare and object rows
         self.weigh_another_button = self.link_button("Weigh another")
         self.weigh_another_button.clicked.connect(self.weigh_another)
-        panel_layout.addLayout(self.section_header("Weigh", None, self.weigh_another_button))
+        weigh, weigh_layout = self.section("Weigh", None, self.weigh_another_button)
         for step in self.weigh_steps:
-            panel_layout.addWidget(self.build_row(step))
+            weigh_layout.addWidget(self.build_row(step))
+        panel_layout.addWidget(weigh)
 
         panel_layout.addStretch()
         tips = QLabel(TIPS)
         tips.setWordWrap(True)
-        tips.setStyleSheet(f"color: {COLOR_MUTED}; font-size: 12px;")
+        tips.setStyleSheet(f"color: {COLOR_MUTED}; font-size: {FONT_SMALL}px;")
+        tips.setContentsMargins(PAD + 1, 0, PAD + 1, 0)   # +1: sections have a 1 px (transparent) border like the banner
         panel_layout.addWidget(tips)
 
         body.addWidget(panel, stretch=2)
@@ -381,33 +518,77 @@ class EMGWeighingScale(QMainWindow):
     @staticmethod
     def link_button(text):
         button = QPushButton(text)
-        button.setFlat(True)
+        button.setProperty("variant", "link")
         button.setCursor(Qt.PointingHandCursor)
-        button.setStyleSheet(f"color: {COLOR_ACCENT};")
         return button
 
     @staticmethod
-    def section_header(title, info_label, button):
+    def action_button():
+        # Record / Retake / Cancel button: the same size everywhere (rows and banner)
+        button = QPushButton()
+        button.setProperty("variant", "secondary")
+        button.setFixedWidth(BUTTON_WIDTH)
+        button.setCursor(Qt.PointingHandCursor)
+        return button
+
+    @staticmethod
+    def divider():
+        line = QFrame()
+        line.setObjectName("divider")
+        line.setFixedHeight(1)
+        return line
+
+    @classmethod
+    def section(cls, title, info_label, button):
+        # Section of the panel: upper-case header (with optional count and link) over a divider. Returns the frame and
+        # the layout the rows go into. Header text, row content and links share the PAD left/right edges.
+        frame = QFrame()
+        frame.setObjectName("section")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         header = QHBoxLayout()
+        header.setContentsMargins(PAD, 10, PAD, 10)
+        header.setSpacing(12)
         label = QLabel(title.upper())
-        label.setStyleSheet(f"font-weight: bold; color: {COLOR_TEXT}; letter-spacing: 1px;")
+        label.setStyleSheet(f"{CAPS_STYLE} color: {COLOR_MUTED};")
         header.addWidget(label)
         header.addStretch()
         if info_label is not None:
             header.addWidget(info_label)
         header.addWidget(button)
-        return header
+        layout.addLayout(header)
+        layout.addWidget(cls.divider())
+        return frame, layout
 
     def build_banner(self):
-        # Fixed-height box at the top of the panel: next step, countdown, recording progress, problems or the result
+        # Fixed-height box at the top of the panel, in three zones split by dividers: header bar (step name and state
+        # label), body (instruction, countdown, progress or result) and footer (hint and button)
         self.banner = QFrame()
         self.banner.setObjectName("banner")
         self.banner.setFixedHeight(BANNER_HEIGHT)
         layout = QVBoxLayout(self.banner)
-        layout.setContentsMargins(12, 8, 12, 10)
-        layout.setSpacing(4)
+        layout.setContentsMargins(1, 1, 1, 1)   # Inside the 1 px border
+        layout.setSpacing(0)
 
+        header = QFrame()
+        header.setObjectName("bannerHeader")
+        header.setFixedHeight(BANNER_HEADER_HEIGHT)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(PAD, 0, PAD, 0)
+        header_layout.setSpacing(10)
         self.banner_title = QLabel()
+        self.banner_title.setStyleSheet(f"font-size: {FONT_TITLE}px; font-weight: bold; color: white;")
+        self.banner_label = QLabel()
+        self.banner_label.setStyleSheet(f"{CAPS_STYLE} color: rgba(255, 255, 255, 0.78);")
+        header_layout.addWidget(self.banner_title)
+        header_layout.addStretch()
+        header_layout.addWidget(self.banner_label)
+        layout.addWidget(header)
+
+        middle = QVBoxLayout()
+        middle.setContentsMargins(PAD, 8, PAD, 8)
+        middle.setSpacing(6)
         self.banner_big = QLabel()
         self.banner_big.setAlignment(Qt.AlignCenter)
         self.banner_body = QLabel()
@@ -415,44 +596,66 @@ class EMGWeighingScale(QMainWindow):
         self.banner_progress = QProgressBar()
         self.banner_progress.setRange(0, self.record_target)
         self.banner_progress.setTextVisible(False)
-        self.banner_progress.setFixedHeight(10)
+        self.banner_progress.setFixedHeight(6)
+        middle.addStretch()
+        middle.addWidget(self.banner_big)
+        middle.addWidget(self.banner_body)
+        middle.addWidget(self.banner_progress)
+        middle.addStretch()
+        layout.addLayout(middle, stretch=1)
 
-        bottom = QHBoxLayout()
+        self.banner_footer_line = self.divider()
+        layout.addWidget(self.banner_footer_line)
+        self.banner_footer = QFrame()
+        self.banner_footer.setObjectName("bannerFooter")
+        self.banner_footer.setFixedHeight(BANNER_FOOTER_HEIGHT)
+        footer_layout = QHBoxLayout(self.banner_footer)
+        footer_layout.setContentsMargins(PAD, 0, PAD, 0)
+        footer_layout.setSpacing(10)
         self.banner_hint = QLabel()
         self.banner_hint.setWordWrap(True)
-        self.banner_button = QPushButton()
-        self.banner_button.setFixedWidth(90)
+        self.banner_button = self.action_button()
         self.banner_button.clicked.connect(lambda: self.banner_action and self.banner_action())
-        bottom.addWidget(self.banner_hint, stretch=1)
-        bottom.addWidget(self.banner_button, alignment=Qt.AlignBottom)
-
-        layout.addWidget(self.banner_title)
-        layout.addStretch()
-        layout.addWidget(self.banner_big)
-        layout.addWidget(self.banner_body)
-        layout.addWidget(self.banner_progress)
-        layout.addStretch()
-        layout.addLayout(bottom)
+        footer_layout.addWidget(self.banner_hint, stretch=1)
+        footer_layout.addWidget(self.banner_button)
+        layout.addWidget(self.banner_footer)
         return self.banner
 
     def build_row(self, step, removable=False):
+        # [rail] status  name (or mass entry, "kg" and a remove ✕)  ...  value  button
         row = QFrame()
         row.setObjectName("stepRow")
-        layout = QHBoxLayout(row)
-        layout.setContentsMargins(6, 3, 6, 3)
-        layout.setSpacing(8)
+        row.setFixedHeight(ROW_HEIGHT)
+        outer = QHBoxLayout(row)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        step.rail = QFrame()     # Accent rail, shown on the next / active step
+        step.rail.setFixedWidth(RAIL_WIDTH)
+        outer.addWidget(step.rail)
+        layout = QHBoxLayout()
+        layout.setContentsMargins(PAD - RAIL_WIDTH, 0, PAD, 0)
+        layout.setSpacing(ROW_SPACING)
+        outer.addLayout(layout)
 
         step.icon = QLabel()
-        step.icon.setFixedWidth(16)
+        step.icon.setFixedSize(STATUS_SIZE, STATUS_SIZE)
         layout.addWidget(step.icon)
         if step.kind == STEP_KNOWN:
             step.mass_input = QLineEdit()
-            step.mass_input.setFixedWidth(60)
+            step.mass_input.setFixedWidth(64)
             step.mass_input.setAlignment(Qt.AlignRight)
             step.mass_input.setPlaceholderText("mass")
             step.mass_input.textChanged.connect(self.refresh)
             layout.addWidget(step.mass_input)
             layout.addWidget(QLabel("kg"))
+            if removable:    # Known weights beyond the required ones can be removed
+                step.remove_button = QPushButton("✕")
+                step.remove_button.setProperty("variant", "icon")
+                step.remove_button.setFixedSize(STATUS_SIZE, CONTROL_HEIGHT)
+                step.remove_button.setCursor(Qt.PointingHandCursor)
+                step.remove_button.setToolTip("Remove this weight")
+                step.remove_button.clicked.connect(lambda: self.remove_known_step(step))
+                layout.addWidget(step.remove_button)
         else:
             step.name_label = QLabel(step.title)
             layout.addWidget(step.name_label)
@@ -460,20 +663,9 @@ class EMGWeighingScale(QMainWindow):
 
         step.value_label = QLabel()
         layout.addWidget(step.value_label)
-        step.button = QPushButton()
-        step.button.setFixedWidth(76)
+        step.button = self.action_button()
         step.button.clicked.connect(lambda: self.on_row_button(step))
         layout.addWidget(step.button)
-
-        # Known weights beyond the required ones can be removed; every row keeps the slot so the columns line up
-        step.remove_button = QPushButton("✕" if removable else "")
-        step.remove_button.setFlat(True)
-        step.remove_button.setFixedWidth(22)
-        step.remove_button.setStyleSheet(f"color: {COLOR_MUTED};")
-        step.remove_button.setEnabled(removable)
-        step.remove_button.setToolTip("Remove this weight" if removable else "")
-        step.remove_button.clicked.connect(lambda: self.remove_known_step(step))
-        layout.addWidget(step.remove_button)
 
         step.row = row
         return row
@@ -508,10 +700,11 @@ class EMGWeighingScale(QMainWindow):
             return f"Known weight {mass:.2f} kg" if mass is not None else f"Known weight {self.known_steps().index(step) + 1}"
         return {STEP_RELAXED: "Relaxed hand", STEP_REST: "Empty hand", STEP_TARE: "Tare", STEP_WEIGH: "Object"}[step.kind]
 
-    def step_heading(self, step):
+    def step_position(self, step):
+        # Banner state label for a step that is next: its place in the calibration or weighing sequence
         if step in self.cal_steps:
-            return f"Step {self.cal_steps.index(step) + 1} of {len(self.cal_steps)} · {self.step_name(step)}"
-        return f"Weigh · Step {self.weigh_steps.index(step) + 1} of 2 · {self.step_name(step)}"
+            return f"Step {self.cal_steps.index(step) + 1} of {len(self.cal_steps)}"
+        return f"Weigh {self.weigh_steps.index(step) + 1} of {len(self.weigh_steps)}"
 
     def step_instruction(self, step):
         if step.kind == STEP_RELAXED:
@@ -677,100 +870,117 @@ class EMGWeighingScale(QMainWindow):
         locked = step in self.weigh_steps and not self.calibrated
         highlight = False
         name_color = COLOR_TEXT
-        primary = False
+        variant = "secondary"
         if step is self.active:
-            icon, icon_color = "●", COLOR_ACCENT
+            icon = "active"
             value, value_color = ("get ready…" if self.phase == PHASE_COUNTDOWN else "recording…"), COLOR_ACCENT
             button, enabled, highlight = "Cancel", True, True
         elif step.value is not None:
             problem = step in self.problems
-            icon, icon_color = ("!", COLOR_WARN) if problem else ("✓", COLOR_OK)
+            icon = "problem" if problem else "done"
             value, value_color = f"E = {step.value:.1f}", (COLOR_WARN if problem else COLOR_MUTED)
             button, enabled = "Retake", not busy and not locked
         elif step is upcoming:
-            icon, icon_color = "○", COLOR_ACCENT
+            icon = "next"
             value, value_color = "", COLOR_MUTED
             ready = step.kind != STEP_KNOWN or (step.mass() is not None and step not in self.mass_errors)
-            button, enabled, highlight, primary = "Record", ready, True, ready
+            button, enabled, highlight, variant = "Record", ready, True, "primary"
         else:
-            icon, icon_color = "○", COLOR_MUTED
+            icon = "locked"
             value, value_color = "", COLOR_MUTED
-            button, enabled, name_color = "Record", False, COLOR_MUTED
+            button, enabled, name_color = "Record", False, COLOR_DISABLED_TEXT
 
-        step.icon.setText(icon)
-        step.icon.setStyleSheet(f"color: {icon_color}; font-size: 15px; font-weight: bold;")
+        step.icon.setPixmap(self.status_icons[icon])
         step.value_label.setText(value)
-        step.value_label.setStyleSheet(f"color: {value_color};")
+        step.value_label.setStyleSheet(f"color: {value_color}; font-size: {FONT_SMALL}px;")
         step.button.setText(button)
         step.button.setEnabled(enabled)
-        step.button.setStyleSheet(PRIMARY_BUTTON_STYLE if primary else "")
-        step.row.setStyleSheet(f"QFrame#stepRow {{ background: {BANNER_STYLES['info'][0]}; border-radius: 4px; }}" if highlight else "")
+        set_style_property(step.button, "variant", variant)
+        # Next / active step: light background and an accent rail. Rows are split by dividers (none under the last row).
+        group = self.cal_steps if step in self.cal_steps else self.weigh_steps
+        divider = "none" if step is group[-1] else f"1px solid {COLOR_DIVIDER}"
+        step.row.setStyleSheet(f"QFrame#stepRow {{ background: {COLOR_ROW_ACTIVE if highlight else 'transparent'}; "
+                               f"border: none; border-bottom: {divider}; }}")
+        step.rail.setStyleSheet(f"background: {COLOR_ACCENT if highlight else 'transparent'}; border: none;")
         if step.name_label is not None:
-            step.name_label.setStyleSheet(f"color: {name_color};")
+            step.name_label.setStyleSheet(f"color: {name_color};" + (" font-weight: bold;" if highlight else ""))
         if step.mass_input is not None:
             error = self.mass_errors.get(step)
             step.mass_input.setEnabled(not busy)
-            step.mass_input.setStyleSheet(f"border: 1px solid {COLOR_ERROR};" if error else "")
+            set_style_property(step.mass_input, "error", bool(error))
             step.mass_input.setToolTip(error or f"Mass in kg (at least {MIN_KNOWN_MASS_KG} kg)")
-        if step.remove_button.text():
+        if step.remove_button is not None:
             step.remove_button.setEnabled(not busy)
 
-    def set_banner(self, style, title, big="", body="", hint="", button=None, action=None, primary=True, enabled=True,
-                   progress=False, big_color=COLOR_TEXT, body_size=15, center_body=False, hint_color=COLOR_MUTED):
-        background, border, title_color = BANNER_STYLES[style]
-        self.banner.setStyleSheet(f"QFrame#banner {{ background: {background}; border: 1px solid {border}; border-radius: 6px; }}")
+    def set_banner(self, style, label, title, big="", body="", hint="", button=None, action=None, primary=True,
+                   enabled=True, progress=False, big_color=COLOR_TEXT, secondary_body=False, hint_color=COLOR_MUTED):
+        # Every state uses the same pieces. style: info (blue), warn (amber) or ok (green) header bar; label: upper-case
+        # state on the right of the bar; title: step name on the left. Body: optional big text (with the body centred
+        # under it), body text and progress bar. Footer (hidden when empty): hint and one action button.
+        # secondary_body shows the body as small muted text (the result's estimate line).
+        color = BANNER_COLORS[style]
+        self.banner.setStyleSheet(f"""
+            QFrame#banner {{ background: white; border: 1px solid {COLOR_BANNER_BORDER}; border-radius: 4px; }}
+            QFrame#bannerHeader {{ background: {color}; border: none; border-top-left-radius: 3px; border-top-right-radius: 3px; }}
+            QFrame#bannerFooter {{ background: {COLOR_FOOTER}; border: none; border-bottom-left-radius: 3px;
+                                   border-bottom-right-radius: 3px; }}""")
         self.banner_title.setText(title)
-        self.banner_title.setStyleSheet(f"font-weight: bold; color: {title_color};")
+        self.banner_label.setText(label.upper())
         self.banner_big.setText(big)
-        self.banner_big.setStyleSheet(f"font-size: 34px; font-weight: bold; color: {big_color};")
+        self.banner_big.setStyleSheet(f"font-size: {FONT_BIG}px; font-weight: bold; color: {big_color};")
         self.banner_big.setVisible(bool(big))
         self.banner_body.setText(body)
-        self.banner_body.setStyleSheet(f"font-size: {body_size}px; color: {COLOR_TEXT};")
-        self.banner_body.setAlignment(Qt.AlignCenter if center_body else Qt.AlignLeft)
+        body_style = (f"font-size: {FONT_SMALL}px; color: {COLOR_MUTED};" if secondary_body
+                      else f"font-size: {FONT_TITLE}px; color: {COLOR_TEXT};")
+        self.banner_body.setStyleSheet(body_style)
+        self.banner_body.setAlignment(Qt.AlignCenter if big else Qt.AlignLeft | Qt.AlignVCenter)
         self.banner_body.setVisible(bool(body))
         self.banner_progress.setVisible(progress)
         self.banner_hint.setText(hint)
-        self.banner_hint.setStyleSheet(f"color: {hint_color};")
+        self.banner_hint.setStyleSheet(f"color: {hint_color}; font-size: {FONT_SMALL}px;")
         self.banner_button.setVisible(button is not None)
         self.banner_button.setText(button or "")
         self.banner_button.setEnabled(enabled)
-        self.banner_button.setStyleSheet(PRIMARY_BUTTON_STYLE if primary and enabled else "")
+        set_style_property(self.banner_button, "variant", "primary" if primary else "secondary")
+        footer = bool(hint) or button is not None
+        self.banner_footer.setVisible(footer)
+        self.banner_footer_line.setVisible(footer)
         self.banner_action = action
         self.banner_step = None
 
     def update_banner(self):
         step = self.active
         if self.phase == PHASE_COUNTDOWN:
-            self.set_banner("info", self.step_heading(step), str(COUNTDOWN_SECONDS), self.step_instruction(step),
-                            button="Cancel", action=self.cancel_step, primary=False, body_size=14, center_body=True)
+            self.set_banner("info", "Get ready", self.step_name(step), str(COUNTDOWN_SECONDS), self.step_instruction(step),
+                            button="Cancel", action=self.cancel_step, primary=False)
             return
         if self.phase == PHASE_RECORDING:
-            self.set_banner("info", f"Recording · {self.step_name(step)}", f"0 / {RECORD_SECONDS} s",
+            self.set_banner("info", "Recording", self.step_name(step), f"0 / {RECORD_SECONDS} s",
                             hint="Keep your hand and arm still", button="Cancel", action=self.cancel_step,
                             primary=False, progress=True)
             self.banner_progress.setValue(0)
             return
         if self.notice:
-            style, title, text, button, action = self.notice
-            self.set_banner(style, title, body=text, body_size=14, button=button, action=action)
+            style, label, title, text, button, action = self.notice
+            self.set_banner(style, label, title, body=text, button=button, action=action)
             return
 
         # A recorded known weight that needs a retake
         problem = next((s for s in self.cal_steps if s in self.problems), None)
         if problem:
-            self.set_banner("warn", f"Retake needed · {self.step_name(problem)}", body=self.problems[problem],
-                            body_size=14, button="Retake", action=lambda: self.start_step(problem))
+            self.set_banner("warn", "Retake needed", self.step_name(problem), body=self.problems[problem],
+                            button="Retake", action=lambda: self.start_step(problem))
             return
 
         upcoming = self.next_step()
         if upcoming is not None and upcoming.kind == STEP_KNOWN and (upcoming.mass() is None or upcoming in self.mass_errors):
             error = self.mass_errors.get(upcoming)
-            self.set_banner("info", self.step_heading(upcoming),
+            self.set_banner("info", self.step_position(upcoming), self.step_name(upcoming),
                             body=f"Enter the mass of this known weight in kg (at least {MIN_KNOWN_MASS_KG} kg).",
                             hint=error or "", hint_color=COLOR_ERROR, button="Record", enabled=False)
             return
         if upcoming is not None:
-            self.set_banner("info", self.step_heading(upcoming), body=self.step_instruction(upcoming),
+            self.set_banner("info", self.step_position(upcoming), self.step_name(upcoming), body=self.step_instruction(upcoming),
                             hint=self.step_hint(upcoming), button="Record", action=lambda: self.start_step(upcoming))
             if upcoming.kind in HOLD_STEPS:
                 self.banner_step = upcoming     # Keep the rest timer ticking
@@ -780,7 +990,7 @@ class EMGWeighingScale(QMainWindow):
             # Everything is recorded but a mass entry is missing or invalid
             bad = next((s for s in self.known_steps() if s.mass() is None or s in self.mass_errors), None)
             message = self.mass_errors.get(bad, "Enter the mass of every known weight.") if bad else ""
-            self.set_banner("warn", "Check the known weights", body=message, body_size=14)
+            self.set_banner("warn", "Calibrate", "Check the known weights", body=message)
             return
         self.show_result()
 
@@ -800,8 +1010,8 @@ class EMGWeighingScale(QMainWindow):
             big, body = f"{low:.2f} – {high:.2f} kg", f"Estimate {weight:.2f} kg (±{ESTIMATE_RANGE * 100:.0f}%)"
         else:
             big, body = "0.00 kg", ""
-        self.set_banner("info", "Estimated weight", big, body, hint=" ".join(notes), big_color=COLOR_OK,
-                        body_size=13, center_body=True, hint_color=COLOR_WARN)
+        self.set_banner("ok", "Result", "Estimated weight", big, body, hint=" ".join(notes), big_color=COLOR_OK,
+                        secondary_body=True, hint_color=COLOR_WARN)
 
     # Signal processing
     def build_filters(self):
@@ -1007,7 +1217,7 @@ class EMGWeighingScale(QMainWindow):
             reason = f"stability {stability:.2f}, limit {STABILITY_LIMIT}"
         if unstable:
             kept = " The previous recording was kept." if step.value is not None else ""
-            self.notice = ("warn", f"Signal unstable · {self.step_name(step)}",
+            self.notice = ("warn", "Signal unstable", self.step_name(step),
                            f"The signal varied too much ({reason}). Rest your arm, keep still, then retake.{kept}",
                            "Retake", lambda: self.start_step(step))
         else:
@@ -1040,7 +1250,7 @@ class EMGWeighingScale(QMainWindow):
         self.channel = index
         self.reset_signal_state()
         self.clear_recordings()
-        self.notice = ("info", f"Channel {index + 1} selected", "Filters and calibration were reset.", "OK", self.dismiss_notice)
+        self.notice = ("info", "Settings changed", f"Channel {index + 1} selected", "Filters and calibration were reset.", "OK", self.dismiss_notice)
         self.refresh()
 
     def on_notch_changed(self, index):
@@ -1049,7 +1259,7 @@ class EMGWeighingScale(QMainWindow):
         self.update_emg_title()
         self.reset_signal_state()    # Rebuilds the filters with the new notch
         self.clear_recordings()
-        self.notice = ("info", f"Notch set to {self.notch_freq} Hz", "Filters and calibration were reset.", "OK", self.dismiss_notice)
+        self.notice = ("info", "Settings changed", f"Notch set to {self.notch_freq} Hz", "Filters and calibration were reset.", "OK", self.dismiss_notice)
         self.refresh()
 
     def dismiss_notice(self):
